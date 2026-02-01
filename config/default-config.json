@@ -1,0 +1,48 @@
+{
+  "version": "1.0",
+  "phase1": {
+    "model": "gemini-2.5-flash",
+    "density": "normal",
+    "minInterval": 2.0
+  },
+  "phase2": {
+    "model": "gemini-2.5-flash"
+  },
+  "phase3": {
+    "depth": "balanced",
+    "mode": "video_tutorial"
+  },
+  "phase4": {
+    "layout": "hierarchical",
+    "canvas": {
+      "nodeWidth": {
+        "text": 350,
+        "file": 350,
+        "group": "auto"
+      },
+      "nodeHeight": {
+        "text": 120,
+        "file": 250,
+        "group": "auto"
+      },
+      "spacing": {
+        "horizontal": 100,
+        "vertical": 80,
+        "groupPadding": 50,
+        "groupGap": 100
+      },
+      "colors": {
+        "chapter": "4",
+        "subchapter": null,
+        "highlight": "3",
+        "warning": "1",
+        "link": "5"
+      }
+    }
+  },
+  "output": {
+    "generateMd": true,
+    "generateCanvas": true,
+    "screenshotDir": "screenshots"
+  }
+}
