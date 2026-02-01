@@ -3,7 +3,7 @@
 > 将视频转换为 Obsidian Canvas 可视化笔记的 Claude Code Skill
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Skill-blue)](https://claude.ai/code)
-[![Canvas Learning System](https://img.shields.io/badge/Canvas%20Learning%20System-Compatible-green)](https://github.com/yourusername/canvas-learning-system)
+[![Canvas Learning System](https://img.shields.io/badge/Canvas%20Learning%20System-Compatible-green)](https://github.com/oinani0721/canvas-learning-system)
 
 ## 概述
 
@@ -70,14 +70,14 @@
 ### 方式一：直接复制到 Claude Code skills 目录
 
 ```bash
-git clone https://github.com/yourusername/video-to-canvas-skill.git
+git clone https://github.com/oinani0721/video-to-canvas-skill.git
 cp -r video-to-canvas-skill ~/.claude/skills/video-to-canvas
 ```
 
 ### 方式二：符号链接
 
 ```bash
-git clone https://github.com/yourusername/video-to-canvas-skill.git ~/projects/video-to-canvas-skill
+git clone https://github.com/oinani0721/video-to-canvas-skill.git ~/projects/video-to-canvas-skill
 ln -s ~/projects/video-to-canvas-skill ~/.claude/skills/video-to-canvas
 ```
 
