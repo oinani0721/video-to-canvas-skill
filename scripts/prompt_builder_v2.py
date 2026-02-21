@@ -1,9 +1,9 @@
 """
-提示词构建器 V2 - 基于 Lore Engine 架构
+提示词构建器 V2 - 基于 Lore Engine 架构 + 三阶段混合管道
 
 核心改进：
 1. 分层结构：主题章节 → 知识点 → 截图（不漏任何细节）
-2. 内容理解：LLM 先理解视频内容，按知识结构组织
+2. 双通道内容：音频转录（Ears）+ 视觉截图（Eyes）→ 完整理解
 3. 深度控制：short_hand / balanced / deep_dive
 4. 智能推理：用 LLM 知识补全不完整的解释
 """
@@ -225,6 +225,13 @@ SCREENSHOT_INTEGRATION = """
 ### 可用截图列表
 {screenshot_list}
 
+### 严格约束（必须遵守！）
+
+**只能引用上面列出的截图文件！** 禁止编造或推测不在列表中的截图路径。
+- 如果某个时间段没有截图，就不要插入图片引用，用文字描述即可
+- 每个 `![...](screenshots/...)` 引用的文件名必须与上面列表中的路径完全匹配
+- 违反此规则会导致笔记中出现损坏的图片链接
+
 ### 集成要求
 
 1. **全部使用**：必须在笔记中引用所有提供的截图
@@ -260,6 +267,43 @@ SCREENSHOT_INTEGRATION = """
 """
 
 # ============================================================================
+# 转录文本集成指令（三阶段混合管道核心）
+# ============================================================================
+
+TRANSCRIPT_INTEGRATION = """
+## 音频转录文本（关键信息来源！）
+
+你同时收到了两个信息通道：
+1. **视觉通道**：截图（展示屏幕上看到的内容）
+2. **音频通道**：转录文本（讲解者实际说的话）
+
+### 转录文本
+{transcript_text}
+
+### 双通道融合规则（最重要！）
+
+1. **音频优先于视觉**：讲解者口述的内容是笔记的主干，截图是辅助说明
+2. **不遗漏口述内容**：即使截图中没有体现，只要讲解者说了，就必须记录
+3. **交叉验证**：
+   - 截图展示的操作 + 讲解者的解释 → 完整的知识点
+   - 讲解者提到但截图未展示的 → 仍然记录（标注为口述内容）
+   - 截图展示但讲解者未提及的 → 简要描述即可
+4. **时间对齐**：利用时间戳将转录文本与截图对应
+   - 截图时间戳附近的转录内容 = 该截图的语音解释
+
+### 常见遗漏场景（必须避免！）
+
+- ❌ 讲解者口述了 3 种类型，但截图只显示标题 → 只写标题
+- ✅ 讲解者口述了 3 种类型，截图只显示标题 → 完整记录 3 种类型 + 截图
+
+- ❌ 讲解者解释了注册流程，但屏幕没有变化 → 跳过
+- ✅ 讲解者解释了注册流程，屏幕没有变化 → 完整记录注册流程
+
+- ❌ 讲解者回答了学生问题，截图是静态幻灯片 → 忽略
+- ✅ 讲解者回答了学生问题，截图是静态幻灯片 → 记录 Q&A
+"""
+
+# ============================================================================
 # 基础指令
 # ============================================================================
 
@@ -270,8 +314,9 @@ BASE_INSTRUCTIONS = """
 
 将视频内容转化为**结构化的教学笔记**，要求：
 1. 按知识结构组织，不是按时间流水账
-2. 不遗漏任何知识点和截图
-3. 补充视频中不完整的解释
+2. **双通道融合**：同时利用音频转录文本和视觉截图，确保口述和屏幕内容都不遗漏
+3. 不遗漏任何知识点和截图
+4. 补充视频中不完整的解释
 
 ## 语言要求
 
@@ -337,6 +382,7 @@ class PromptBuilderV2:
         self._mode = None
         self._depth = None
         self._screenshots = []
+        self._has_transcript = False
 
     def with_mode(self, mode: str) -> "PromptBuilderV2":
         """设置内容类型模式"""
@@ -373,6 +419,24 @@ class PromptBuilderV2:
         self.parts.append(integration)
         return self
 
+    def with_transcript(self, transcript_text: str) -> "PromptBuilderV2":
+        """
+        添加音频转录文本（三阶段管道核心）
+
+        Args:
+            transcript_text: 带时间戳的转录文本，格式如：
+                [00:00-00:15] Welcome to CS61C...
+                [00:15-00:30] Today we'll cover...
+        """
+        self._has_transcript = True
+
+        integration = TRANSCRIPT_INTEGRATION.replace(
+            "{transcript_text}",
+            transcript_text if transcript_text else "（无转录文本）"
+        )
+        self.parts.append(integration)
+        return self
+
     def with_inference(self) -> "PromptBuilderV2":
         """启用智能推理补全"""
         self.parts.append(INTELLIGENT_INFERENCE)
@@ -393,54 +457,66 @@ class PromptBuilderV2:
         return "\n\n".join(self.parts)
 
     def __str__(self) -> str:
-        return f"PromptBuilderV2(mode={self._mode}, depth={self._depth}, screenshots={len(self._screenshots)})"
+        return (f"PromptBuilderV2(mode={self._mode}, depth={self._depth}, "
+                f"screenshots={len(self._screenshots)}, transcript={self._has_transcript})")
 
 
 # ============================================================================
 # 预设工厂函数
 # ============================================================================
 
-def create_tutorial_notes_prompt(screenshots: list) -> str:
+def create_tutorial_notes_prompt(screenshots: list, transcript: str = "") -> str:
     """创建教程视频笔记提示词（推荐）"""
-    return (PromptBuilderV2()
-            .with_mode("video_tutorial")
-            .with_depth("balanced")
-            .with_hierarchy()
-            .with_screenshots(screenshots)
+    builder = (PromptBuilderV2()
+               .with_mode("video_tutorial")
+               .with_depth("balanced")
+               .with_hierarchy()
+               .with_screenshots(screenshots))
+    if transcript:
+        builder.with_transcript(transcript)
+    return (builder
             .with_inference()
             .with_summary()
             .build())
 
 
-def create_lecture_notes_prompt(screenshots: list) -> str:
+def create_lecture_notes_prompt(screenshots: list, transcript: str = "") -> str:
     """创建讲座笔记提示词"""
-    return (PromptBuilderV2()
-            .with_mode("lecture")
-            .with_depth("balanced")
-            .with_hierarchy()
-            .with_screenshots(screenshots)
+    builder = (PromptBuilderV2()
+               .with_mode("lecture")
+               .with_depth("balanced")
+               .with_hierarchy()
+               .with_screenshots(screenshots))
+    if transcript:
+        builder.with_transcript(transcript)
+    return (builder
             .with_inference()
             .with_summary()
             .build())
 
 
-def create_quick_notes_prompt(screenshots: list) -> str:
+def create_quick_notes_prompt(screenshots: list, transcript: str = "") -> str:
     """创建快速笔记提示词"""
-    return (PromptBuilderV2()
-            .with_mode("video_tutorial")
-            .with_depth("short_hand")
-            .with_hierarchy()
-            .with_screenshots(screenshots)
-            .build())
+    builder = (PromptBuilderV2()
+               .with_mode("video_tutorial")
+               .with_depth("short_hand")
+               .with_hierarchy()
+               .with_screenshots(screenshots))
+    if transcript:
+        builder.with_transcript(transcript)
+    return builder.build()
 
 
-def create_deep_notes_prompt(screenshots: list) -> str:
+def create_deep_notes_prompt(screenshots: list, transcript: str = "") -> str:
     """创建深度笔记提示词"""
-    return (PromptBuilderV2()
-            .with_mode("video_tutorial")
-            .with_depth("deep_dive")
-            .with_hierarchy()
-            .with_screenshots(screenshots)
+    builder = (PromptBuilderV2()
+               .with_mode("video_tutorial")
+               .with_depth("deep_dive")
+               .with_hierarchy()
+               .with_screenshots(screenshots))
+    if transcript:
+        builder.with_transcript(transcript)
+    return (builder
             .with_inference()
             .with_summary()
             .build())
