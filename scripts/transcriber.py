@@ -149,28 +149,14 @@ def _check_faster_whisper() -> bool:
         return False
 
 
-def transcribe_with_faster_whisper(
-    audio_path: str,
-    model_size: str = "large-v3",
-    language: str = None,
-    vad_filter: bool = True,
-    device: str = "auto",
-    compute_type: str = "auto"
-) -> TranscriptResult:
+def _faster_whisper_worker(audio_path, model_size, language, vad_filter, device, compute_type, result_file):
     """
-    使用 faster-whisper 进行本地转录
-
-    Args:
-        audio_path: 音频文件路径
-        model_size: 模型大小 (tiny/base/small/medium/large-v3)
-        language: 语言代码 (None=自动检测, "en", "zh" 等)
-        vad_filter: 是否启用 VAD 过滤（强烈推荐，减少幻觉）
-        device: 计算设备 ("auto"/"cpu"/"cuda")
-        compute_type: 精度 ("auto"/"float16"/"int8")
-
-    Returns:
-        TranscriptResult
+    子进程 worker：加载模型、转录、保存结果到 JSON。
+    子进程退出时 ctranslate2 的 CUDA 清理可能 abort，但不影响主进程。
     """
+    import json as _json
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
     from faster_whisper import WhisperModel
 
     # 自动检测设备和精度
@@ -193,7 +179,7 @@ def transcribe_with_faster_whisper(
         vad_params = {
             "threshold": 0.5,
             "min_speech_duration_ms": 250,
-            "max_speech_duration_s": 30,        # 防止超长段
+            "max_speech_duration_s": 30,
             "min_silence_duration_ms": 500,
             "speech_pad_ms": 200,
         }
@@ -214,22 +200,94 @@ def transcribe_with_faster_whisper(
     print(f"  检测语言: {detected_lang} (概率: {info.language_probability:.2f})")
 
     # 收集所有段落
-    segments = []
+    segments_data = []
     for seg in segments_iter:
-        segments.append(TranscriptSegment(
-            start=seg.start,
-            end=seg.end,
-            text=seg.text
-        ))
+        segments_data.append({
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text
+        })
 
     elapsed = time.time() - start_time
-    print(f"  转录完成: {len(segments)} 个片段, 耗时 {elapsed:.1f}s")
+    print(f"  转录完成: {len(segments_data)} 个片段, 耗时 {elapsed:.1f}s")
 
-    return TranscriptResult(
-        segments=segments,
-        backend="faster-whisper",
-        language=detected_lang
-    )
+    # 保存结果到临时文件（在模型清理前）
+    result = {
+        "segments": segments_data,
+        "language": detected_lang,
+        "backend": "faster-whisper"
+    }
+    with open(result_file, "w", encoding="utf-8") as f:
+        _json.dump(result, f, ensure_ascii=False)
+
+    print(f"  转录结果已保存到临时文件")
+    # 子进程退出后 ctranslate2 清理可能 abort，但结果已保存
+
+
+def transcribe_with_faster_whisper(
+    audio_path: str,
+    model_size: str = "large-v3",
+    language: str = None,
+    vad_filter: bool = True,
+    device: str = "auto",
+    compute_type: str = "auto"
+) -> TranscriptResult:
+    """
+    使用 faster-whisper 进行本地转录（子进程隔离）
+
+    在子进程中运行转录，避免 ctranslate2/CUDA 清理时 abort 导致主进程崩溃。
+
+    Args:
+        audio_path: 音频文件路径
+        model_size: 模型大小 (tiny/base/small/medium/large-v3)
+        language: 语言代码 (None=自动检测, "en", "zh" 等)
+        vad_filter: 是否启用 VAD 过滤（强烈推荐，减少幻觉）
+        device: 计算设备 ("auto"/"cpu"/"cuda")
+        compute_type: 精度 ("auto"/"float16"/"int8")
+
+    Returns:
+        TranscriptResult
+    """
+    import multiprocessing
+    import tempfile
+
+    # 创建临时文件用于进程间传递结果
+    result_fd, result_file = tempfile.mkstemp(suffix=".json", prefix="whisper_result_")
+    os.close(result_fd)
+
+    try:
+        # 在子进程中运行转录
+        ctx = multiprocessing.get_context("spawn")
+        p = ctx.Process(
+            target=_faster_whisper_worker,
+            args=(audio_path, model_size, language, vad_filter, device, compute_type, result_file)
+        )
+        p.start()
+        p.join()  # 等待完成（可能会 abort，但结果已保存）
+
+        # 读取结果
+        if not os.path.exists(result_file) or os.path.getsize(result_file) == 0:
+            raise RuntimeError(f"faster-whisper 子进程未产生结果 (exit code: {p.exitcode})")
+
+        with open(result_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        segments = [
+            TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
+            for s in data["segments"]
+        ]
+
+        print(f"  子进程退出码: {p.exitcode} ({'正常' if p.exitcode == 0 else '非正常(CUDA清理导致, 结果已保存)'})")
+
+        return TranscriptResult(
+            segments=segments,
+            backend="faster-whisper",
+            language=data["language"]
+        )
+    finally:
+        # 清理临时文件
+        if os.path.exists(result_file):
+            os.remove(result_file)
 
 
 def transcribe_with_gemini(
@@ -315,11 +373,24 @@ def transcribe_with_gemini(
         text = text[:-3]
     text = text.strip()
 
+    # 预处理: 修复畸形浮点数 (如 1.0.864 → 10.864)
+    import re
+    def _fix_malformed_floats(s):
+        """Fix floats with multiple dots like 1.0.864 in JSON text."""
+        def _repl(m):
+            val = m.group(0)
+            parts = val.split('.')
+            if len(parts) <= 2:
+                return val
+            return parts[0] + '.' + ''.join(parts[1:])
+        return re.sub(r'\d+\.\d+(?:\.\d+)+', _repl, s)
+
+    text = _fix_malformed_floats(text)
+
     try:
         raw_segments = json.loads(text)
     except json.JSONDecodeError as e:
         # 尝试修复常见 JSON 问题
-        import re
         print(f"  [JSON修复] 原始错误: {e}")
 
         # 修复 1: 尾随逗号
@@ -346,12 +417,20 @@ def transcribe_with_gemini(
                     pass
 
             # 修复 4: 正则逐条提取
+            def _safe_float(s):
+                """Handle malformed floats like '1.0.864' → keep first dot only."""
+                parts = s.split('.')
+                if len(parts) <= 2:
+                    return float(s)
+                # Multiple dots: keep first part + join rest as decimals
+                return float(parts[0] + '.' + ''.join(parts[1:]))
+
             if 'raw_segments' not in dir():
                 pattern = r'\{\s*"start"\s*:\s*([\d.]+)\s*,\s*"end"\s*:\s*([\d.]+)\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}'
                 matches = re.findall(pattern, text, re.DOTALL)
                 if matches:
                     raw_segments = [
-                        {"start": float(m[0]), "end": float(m[1]), "text": m[2]}
+                        {"start": _safe_float(m[0]), "end": _safe_float(m[1]), "text": m[2]}
                         for m in matches
                     ]
                     print(f"  [JSON修复] 正则提取成功: {len(raw_segments)} 个片段")
