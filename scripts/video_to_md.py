@@ -44,6 +44,7 @@ if os.path.exists(LORE_ENGINE_ENV):
                     os.environ[key] = value
 
 from styles import STYLES, VIDEO_PRESETS, get_style_prompt, list_styles, list_presets
+from add_video_timestamps import convert_timestamps, add_video_embed
 from prompt_builder import (
     PromptBuilder,
     CHANGE_DETECTION_PROMPT,
@@ -842,6 +843,14 @@ def main(
     # 后处理 2：验证图片引用，移除指向不存在文件的引用
     # 解决 Gemini 幻觉生成超出视频实际时长的截图引用
     markdown_text = validate_image_references(markdown_text, screenshot_dir)
+
+    # 后处理 3：转换时间戳为 Media Extended 可点击格式
+    video_filename = os.path.basename(video_path)
+    print(f"\n[后处理 3] 转换时间戳为 Media Extended 格式...")
+    markdown_text = convert_timestamps(markdown_text, video_filename)
+
+    # 后处理 4：在笔记顶部添加视频嵌入
+    header = add_video_embed(header, video_filename)
 
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(header + markdown_text)

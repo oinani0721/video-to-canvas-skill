@@ -11,7 +11,8 @@
 
 转换规则:
     截图行: *图：描述 [07:05]*  →  *图：描述 [[video.mp4#t=425|⏱07:05]]*
-    正文行: 概念说明 [02:30]   →  概念说明  (移除不准确的时间戳)
+    正文行: 概念说明 [02:30]   →  概念说明 [02:30]()  (Media Extended 可点击格式)
+    时间范围: [02:30-03:15]     →  (移除，不适合做可点击链接)
 """
 
 import re
@@ -41,19 +42,21 @@ def is_screenshot_caption_line(line: str) -> bool:
 def convert_timestamps(md_text: str, video_filename: str) -> str:
     """
     智能转换时间戳：
-    - 截图说明行的时间戳 → 可点击 Media Extended 链接（准确）
-    - 正文中的转录时间戳 → 移除（不准确）
+    - 截图说明行的时间戳 → 可点击 Media Extended wikilink（准确）
+    - 正文中的单时间戳 → [MM:SS]() 可点击格式
+    - 正文中的时间范围 → 移除（不适合做可点击链接）
     """
     lines = md_text.split("\n")
     result = []
     in_code_block = False
 
-    # 匹配 [MM:SS] 或 [HH:MM:SS]
-    ts_pattern = re.compile(r'(?<!\!)\[(\d{1,2}:\d{2}(?::\d{2})?)\]')
-    # 匹配 [MM:SS-MM:SS] 时间范围
-    ts_range_pattern = re.compile(r'\[(\d{1,2}:\d{2}(?::\d{2})?)-(\d{1,2}:\d{2}(?::\d{2})?)\]')
+    # 匹配 [MM:SS] 或 [HH:MM:SS]，兼容已有 () 后缀
+    ts_pattern = re.compile(r'(?<!\!)\[(\d{1,2}:\d{2}(?::\d{2})?)\](?:\(\))?')
+    # 匹配 [MM:SS-MM:SS] 时间范围，兼容已有 () 后缀
+    ts_range_pattern = re.compile(r'\[(\d{1,2}:\d{2}(?::\d{2})?)-(\d{1,2}:\d{2}(?::\d{2})?)\](?:\(\))?')
 
     screenshot_converted = 0
+    inline_converted = 0
     transcript_removed = 0
 
     for line in lines:
@@ -79,22 +82,26 @@ def convert_timestamps(md_text: str, video_filename: str) -> str:
                 screenshot_converted += ts_pattern.findall(line).__len__()
             result.append(new_line)
         else:
-            # ❌ 正文行：移除不准确的转录时间戳
-            # 先移除时间范围
+            # 正文行：转换单时间戳为可点击格式，移除时间范围
+            # 先移除时间范围（不适合做可点击链接）
             new_line, n1 = ts_range_pattern.subn("", line)
-            # 再移除单时间戳
-            new_line, n2 = ts_pattern.subn("", new_line)
-            transcript_removed += n1 + n2
+            # 单时间戳 → [MM:SS]() 可点击格式
+            def replace_inline_ts(match):
+                ts = match.group(1)
+                return f"[{ts}]()"
+            new_line, n2 = ts_pattern.subn(replace_inline_ts, new_line)
+            inline_converted += n2
+            transcript_removed += n1
 
             # 清理移除后可能产生的多余空格
             new_line = re.sub(r'  +', ' ', new_line)
             new_line = re.sub(r' ([。，、；：])', r'\1', new_line)
-            new_line = re.sub(r'\( *\)', '', new_line)  # 空括号
 
             result.append(new_line)
 
-    print(f"  截图时间戳 → 可点击链接: {screenshot_converted} 个")
-    print(f"  转录时间戳 → 已移除: {transcript_removed} 个")
+    print(f"  截图时间戳 → 可点击 wikilink: {screenshot_converted} 个")
+    print(f"  内联时间戳 → 可点击 [MM:SS](): {inline_converted} 个")
+    print(f"  时间范围 → 已移除: {transcript_removed} 个")
 
     return "\n".join(result)
 
