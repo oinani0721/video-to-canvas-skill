@@ -83,16 +83,95 @@ ln -s ~/projects/video-to-canvas-skill ~/.claude/skills/video-to-canvas
 
 ## 依赖
 
-- **Claude Code**: Claude Code CLI 工具
-- **Gemini API**: 用于视频分析和笔记生成
-- **FFmpeg**: 用于提取视频截图
-- **Python 3.8+**: 运行脚本
+### 系统依赖
 
-### 环境变量
+| 依赖 | 版本要求 | 安装方式 | 用途 |
+|------|---------|---------|------|
+| **Claude Code** | 最新版 | `npm install -g @anthropic-ai/claude-code` | Skill 运行环境 |
+| **Python** | 3.8+ (推荐 3.10+) | 见下方 | 运行三阶段管道脚本 |
+| **FFmpeg** | 5.0+ | 见下方 | 提取视频截图 + 音频 |
+| **uv** (推荐) | 0.10+ | `pip install uv` 或 `curl -LsSf https://astral.sh/uv/install.sh \| sh` | Python 包管理（比 pip 快 100x） |
+
+### Python 依赖
+
+| 包名 | 用途 | 必需? |
+|------|------|-------|
+| `google-genai` | Gemini API 客户端（视频分析、转录、笔记生成） | 是 |
+| `faster-whisper` | 本地音频转录（GPU 加速，更精准的时间戳） | 可选（回退到 Gemini 云端转录） |
+| `torch` (CUDA) | PyTorch GPU 加速（配合 faster-whisper） | 可选（无 GPU 则 CPU 模式） |
+
+### 安装步骤
+
+#### 1. 安装 FFmpeg
 
 ```bash
-export GEMINI_API_KEY="your-api-key"
-# 或在 ~/lore-engine/.env 中配置
+# Windows (winget)
+winget install Gyan.FFmpeg
+
+# macOS (Homebrew)
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+```
+
+#### 2. 安装 Python + 创建虚拟环境
+
+```bash
+# 推荐使用 uv 管理 Python 和依赖
+uv python install 3.10
+cd ~/.claude/skills/video-to-canvas/scripts
+uv venv .venv --python 3.10
+```
+
+#### 3. 安装 Python 依赖
+
+```bash
+cd ~/.claude/skills/video-to-canvas/scripts
+
+# 必需
+uv pip install google-genai --python .venv/Scripts/python.exe   # Windows
+uv pip install google-genai --python .venv/bin/python            # macOS/Linux
+
+# 可选：本地转录（推荐有 NVIDIA GPU 的用户）
+uv pip install faster-whisper
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA 加速
+```
+
+#### 4. 配置 API Key
+
+```bash
+# 方式一：环境变量（推荐）
+export GEMINI_API_KEY="your-gemini-api-key"
+
+# 方式二：.env 文件
+echo 'GEMINI_API_KEY=your-gemini-api-key' > ~/.claude/skills/video-to-canvas/.env
+```
+
+获取 Gemini API Key: https://aistudio.google.com/apikey
+
+#### 5. Windows 注意事项
+
+- SKILL.md 已配置使用 `.venv/Scripts/python.exe` 和 `PYTHONUTF8=1`，无需额外设置
+- 如果 `python` 命令打开 Microsoft Store，在 **Settings > Apps > App execution aliases** 中关闭 python.exe 和 python3.exe 的开关
+
+### 验证安装
+
+```bash
+cd ~/.claude/skills/video-to-canvas/scripts
+
+# 检查 Python
+.venv/Scripts/python.exe --version        # Windows
+.venv/bin/python --version                 # macOS/Linux
+
+# 检查核心依赖
+.venv/Scripts/python.exe -c "from google import genai; print('OK:', genai.__version__)"
+
+# 检查 FFmpeg
+ffprobe -version
+
+# 检查 GPU（可选）
+.venv/Scripts/python.exe -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ```
 
 ## 使用
