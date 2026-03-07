@@ -118,7 +118,7 @@ hooks:
 1. 运行 Python 脚本执行三阶段管道：
    ```bash
    cd ~/.claude/skills/video-to-canvas/scripts
-   python video_to_md.py "<视频路径>" -o "<输出目录>" --depth balanced
+   PYTHONUTF8=1 .venv/Scripts/python.exe video_to_md.py "<视频路径>" -o "<输出目录>" --depth balanced
    ```
 
 2. 等待执行完成，获取：
@@ -399,7 +399,7 @@ Canvas 中的路径应为：
 
 ```bash
 cd ~/.claude/skills/video-to-canvas/scripts
-python video_to_md.py "<视频路径>" -o "<输出目录>" --depth <深度>
+PYTHONUTF8=1 .venv/Scripts/python.exe video_to_md.py "<视频路径>" -o "<输出目录>" --depth <深度>
 ```
 
 等待脚本完成，检查输出：

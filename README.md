@@ -10,7 +10,7 @@
 `/video-to-canvas` 是一个端到端的 Claude Code Skill，将视频内容自动转换为结构化的 Obsidian Canvas 可视化笔记。
 
 ```
-📹 视频 → 👂 转录 → 👁️ 视觉检测+截图 → 🧠 融合笔记 → ⏱️ 时间戳转换 → 📊 Canvas
+📹 视频 → 🔍 Gemini 分析 → 📸 截图提取 → 📝 MD 笔记 → 📊 Canvas 可视化
 ```
 
 ## 与 Canvas Learning System 的配合
@@ -126,37 +126,24 @@ export GEMINI_API_KEY="your-api-key"
 
 ## 工作流程
 
-### Stage 1 (Ears): 音频转录
+### Phase 1: Gemini 视觉分析
 
-使用 WhisperX（首选）或 Gemini Audio（备选）进行音频转录，支持 15 分钟分段避免幻觉。
+使用 Gemini 2.5 Flash 分析视频，检测画面变化点：
+- 幻灯片切换
+- 代码变化
+- 图表出现
+- UI 状态变化
 
-### Stage 2 (Eyes): Gemini 视觉分析 + FFmpeg 截图
+### Phase 2: FFmpeg 截图提取
 
-使用 Gemini 2.5 Flash 分析视频，检测画面变化点（幻灯片切换、代码变化、图表出现），然后用 FFmpeg 提取关键帧截图。
+根据变化点时间戳，使用 FFmpeg 提取关键帧截图。
 
-### Stage 3 (Brain): LLM 双通道融合笔记生成
+### Phase 3: 笔记生成（V2 Lore Engine 架构）
 
-融合转录文本 + 截图生成结构化笔记：
+使用 V2 架构生成结构化笔记：
 - **按知识结构组织**（不是时间流水账）
 - **智能推理补全**（填补视频中不完整的解释）
 - **分层组织**（主题 → 子主题 → 知识点）
-
-### Stage 3.5: 后处理 — Media Extended 时间戳转换
-
-自动将笔记中的时间戳转换为 Obsidian [Media Extended](https://github.com/aidenlx/media-extended) 插件兼容的可点击格式：
-
-| 元素 | 转换前 | 转换后 | 说明 |
-|------|--------|--------|------|
-| 截图说明 | `*图：描述 [05:07]*` | `*图：描述 [[video.mp4#t=307\|⏱05:07]]*` | Wikilink，点击跳转视频 |
-| 内联时间戳 | `触发建议 [00:48]` | `触发建议 [00:48]()` | Media Extended 可点击格式 |
-| 时间范围 | `[00:48-00:54]` | *(移除)* | 不适合做点击目标 |
-| 笔记顶部 | *(无)* | `> [!video]- 视频播放器`<br>`> ![[video.mp4]]` | 嵌入视频播放器 |
-
-转换由 `add_video_timestamps.py` 执行，已集成到管道中自动运行。也可独立使用：
-
-```bash
-python scripts/add_video_timestamps.py "笔记.md" "视频.mp4"
-```
 
 ### Phase 4: Canvas 智能生成
 
@@ -207,13 +194,11 @@ video-to-canvas-skill/
 ├── config/
 │   └── default-config.json    # 默认配置
 ├── scripts/
-│   ├── video_to_md.py             # Stage 1-3 主管道脚本
-│   ├── transcriber.py             # Stage 1 音频转录 (WhisperX/Gemini)
-│   ├── add_video_timestamps.py    # Stage 3.5 Media Extended 时间戳转换
-│   ├── prompt_builder_v2.py       # V2 提示词构建器
-│   ├── prompt_builder.py          # V1 提示词构建器
-│   ├── styles.py                  # 笔记风格定义
-│   └── fusion_detector.py         # 双通道融合检测器
+│   ├── video_to_md.py         # Phase 1-3 执行脚本
+│   ├── prompt_builder_v2.py   # V2 提示词构建器
+│   ├── prompt_builder.py      # V1 提示词构建器
+│   ├── styles.py              # 笔记风格定义
+│   └── fusion_detector.py     # 双通道融合检测器
 └── sub-skills/                 # 子 Skill（可选）
 ```
 
