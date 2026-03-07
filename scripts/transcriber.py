@@ -16,6 +16,9 @@ import subprocess
 import tempfile
 import time
 
+_THIS_FILE = os.path.abspath(__file__)
+_fw_model_ref = None  # Global ref to prevent GC of WhisperModel (CUDA destructor crash)
+
 
 class TranscriptSegment:
     """单条转录片段"""
@@ -171,6 +174,11 @@ def transcribe_with_faster_whisper(
     Returns:
         TranscriptResult
     """
+    # Subprocess isolation: prevent CUDA segfault on Windows
+    # ctranslate2 destructor crashes during cleanup; subprocess + os._exit(0) avoids this
+    if not os.environ.get("_WHISPER_SUBPROCESS_WORKER"):
+        return _transcribe_via_subprocess(audio_path, model_size, language, vad_filter)
+
     from faster_whisper import WhisperModel
 
     # 自动检测设备和精度
@@ -178,14 +186,17 @@ def transcribe_with_faster_whisper(
         try:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
+        except (ImportError, OSError, RuntimeError) as e:
+            print(f"  [GPU] CUDA unavailable ({type(e).__name__}), falling back to CPU")
             device = "cpu"
 
     if compute_type == "auto":
         compute_type = "float16" if device == "cuda" else "int8"
 
     print(f"  加载 faster-whisper 模型: {model_size} ({device}/{compute_type})")
+    global _fw_model_ref  # noqa: prevent GC from destroying model before os._exit(0)
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    _fw_model_ref = model  # prevent GC: ctranslate2 CUDA destructor crashes on Windows
 
     # VAD 参数（社区验证的最佳配置）
     vad_params = None
@@ -227,6 +238,160 @@ def transcribe_with_faster_whisper(
 
     return TranscriptResult(
         segments=segments,
+        backend="faster-whisper",
+        language=detected_lang
+    )
+
+
+def _get_audio_duration(audio_path: str) -> float:
+    """用 ffprobe 获取音频时长（秒）"""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        audio_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return 0.0
+    return float(result.stdout.strip())
+
+
+def _split_audio_chunks(audio_path: str, chunk_seconds: float = 900.0) -> list:
+    """
+    用 ffmpeg 将音频分割为多个块。
+
+    Returns:
+        list of (chunk_path, offset_seconds)
+    """
+    duration = _get_audio_duration(audio_path)
+    if duration <= 0:
+        return [(audio_path, 0.0)]
+
+    if duration <= chunk_seconds * 1.2:
+        return [(audio_path, 0.0)]
+
+    chunks = []
+    offset = 0.0
+    idx = 0
+    base = os.path.splitext(audio_path)[0]
+    while offset < duration:
+        chunk_path = f"{base}_chunk{idx}.wav"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", audio_path,
+            "-ss", str(offset),
+            "-t", str(chunk_seconds),
+            "-acodec", "pcm_s16le",
+            "-ar", "16000", "-ac", "1",
+            chunk_path
+        ]
+        subprocess.run(cmd, capture_output=True)
+        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
+            chunks.append((chunk_path, offset))
+        offset += chunk_seconds
+        idx += 1
+
+    return chunks
+
+
+def _transcribe_single_chunk(
+    audio_path: str,
+    model_size: str,
+    language: str,
+    vad_filter: bool,
+    time_offset: float = 0.0
+) -> TranscriptResult:
+    """在隔离子进程中转录单个音频块"""
+    tmp_json = tempfile.mktemp(suffix='_transcript.json')
+
+    cmd = [
+        sys.executable, _THIS_FILE,
+        "--subprocess-worker",
+        "--audio", audio_path,
+        "--output", tmp_json,
+        "--model", model_size,
+    ]
+    if language:
+        cmd.extend(["--language", language])
+    if not vad_filter:
+        cmd.append("--no-vad")
+
+    env = os.environ.copy()
+    env["_WHISPER_SUBPROCESS_WORKER"] = "1"
+
+    proc = subprocess.Popen(cmd, env=env)
+    returncode = proc.wait()
+
+    if os.path.exists(tmp_json) and os.path.getsize(tmp_json) > 0:
+        if returncode != 0:
+            print(f"  [Subprocess] 警告: 子进程退出码 {returncode} (CUDA 析构崩溃，输出已保存，忽略)")
+    elif returncode != 0:
+        raise RuntimeError(
+            f"Transcription subprocess failed (exit code {returncode}). "
+            f"Check stderr output above for details."
+        )
+    else:
+        raise RuntimeError("Transcription subprocess did not produce output file")
+
+    result = load_transcript(tmp_json)
+
+    # 调整时间戳偏移
+    if time_offset > 0:
+        for seg in result.segments:
+            seg.start += time_offset
+            seg.end += time_offset
+
+    try:
+        os.remove(tmp_json)
+    except OSError:
+        pass
+
+    return result
+
+
+def _transcribe_via_subprocess(
+    audio_path: str,
+    model_size: str,
+    language: str,
+    vad_filter: bool,
+    chunk_minutes: float = 15.0
+) -> TranscriptResult:
+    """
+    在隔离子进程中执行 faster-whisper 转录，绕过 CUDA 析构崩溃。
+    长音频自动分块（默认 15 分钟），每块在独立子进程中处理，
+    避免 ctranslate2 处理长音频时的 GPU 内存崩溃。
+    """
+    chunk_seconds = chunk_minutes * 60.0
+    chunks = _split_audio_chunks(audio_path, chunk_seconds)
+
+    print(f"  [Subprocess] Audio split into {len(chunks)} chunk(s)")
+    print(f"  [Subprocess] Model: {model_size}, Audio: {os.path.basename(audio_path)}")
+
+    all_segments = []
+    detected_lang = ""
+
+    for i, (chunk_path, offset) in enumerate(chunks):
+        print(f"  [Subprocess] Transcribing chunk {i+1}/{len(chunks)} (offset={offset:.0f}s)...")
+        result = _transcribe_single_chunk(
+            chunk_path, model_size, language, vad_filter, time_offset=offset
+        )
+        all_segments.extend(result.segments)
+        if not detected_lang:
+            detected_lang = result.language
+        print(f"  [Subprocess] Chunk {i+1}: {len(result.segments)} segments")
+
+        # 清理分块文件（不删除原始音频）
+        if chunk_path != audio_path:
+            try:
+                os.remove(chunk_path)
+            except OSError:
+                pass
+
+    print(f"  [Subprocess] Total: {len(all_segments)} segments from {len(chunks)} chunks")
+
+    return TranscriptResult(
+        segments=all_segments,
         backend="faster-whisper",
         language=detected_lang
     )
@@ -486,7 +651,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="视频音频转录工具")
-    parser.add_argument("video", help="视频文件路径")
+    parser.add_argument("video", nargs="?", help="视频文件路径")
     parser.add_argument("-o", "--output", help="输出 JSON 路径")
     parser.add_argument("--backend", default="auto",
                         choices=["auto", "faster-whisper", "gemini"],
@@ -501,8 +666,34 @@ if __name__ == "__main__":
                         help="保留提取的音频文件")
     parser.add_argument("--chunk-minutes", type=float, default=15.0,
                         help="分块时长（分钟，默认 15）")
+    # Subprocess worker mode (internal use only)
+    parser.add_argument("--subprocess-worker", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--audio", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    # === Subprocess worker mode ===
+    if args.subprocess_worker:
+        if not args.audio or not args.output:
+            print("错误：subprocess-worker 模式需要 --audio 和 --output 参数")
+            sys.exit(1)
+        # Ensure env var is set so transcribe_with_faster_whisper runs directly
+        os.environ["_WHISPER_SUBPROCESS_WORKER"] = "1"
+        result = transcribe_with_faster_whisper(
+            audio_path=args.audio,
+            model_size=args.model,
+            language=args.language,
+            vad_filter=not args.no_vad
+        )
+        save_transcript(result, args.output)
+        print(f"  [Worker] Transcription complete, exiting cleanly...")
+        os._exit(0)  # Skip CUDA destructors — prevents segfault
+
+    # === Normal CLI mode ===
+    if not args.video:
+        print("错误：请提供视频文件路径")
+        sys.exit(1)
 
     if not os.path.exists(args.video):
         print(f"错误：视频文件不存在: {args.video}")

@@ -118,60 +118,33 @@ sudo apt install ffmpeg
 #### 2. 安装 Python + 创建虚拟环境
 
 ```bash
-# 推荐使用 uv 管理 Python 和依赖
-uv python install 3.10
-cd ~/.claude/skills/video-to-canvas/scripts
-uv venv .venv --python 3.10
+cd ~/.claude/skills/video-to-canvas/scripts && uv sync --extra gpu
 ```
 
-#### 3. 安装 Python 依赖
+This single command handles everything: downloads the correct Python version, creates a venv, and installs all dependencies (including PyTorch with CUDA support).
+
+#### 3. 配置 API Key
 
 ```bash
-cd ~/.claude/skills/video-to-canvas/scripts
-
-# 必需
-uv pip install google-genai --python .venv/Scripts/python.exe   # Windows
-uv pip install google-genai --python .venv/bin/python            # macOS/Linux
-
-# 可选：本地转录（推荐有 NVIDIA GPU 的用户）
-uv pip install faster-whisper
-uv pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA 加速
-```
-
-#### 4. 配置 API Key
-
-```bash
-# 方式一：环境变量（推荐）
-export GEMINI_API_KEY="your-gemini-api-key"
-
-# 方式二：.env 文件
-echo 'GEMINI_API_KEY=your-gemini-api-key' > ~/.claude/skills/video-to-canvas/.env
+cp ~/.claude/skills/video-to-canvas/.env.example ~/.claude/skills/video-to-canvas/.env
+# Edit .env and add your Gemini API Key
 ```
 
 获取 Gemini API Key: https://aistudio.google.com/apikey
-
-#### 5. Windows 注意事项
-
-- SKILL.md 已配置使用 `.venv/Scripts/python.exe` 和 `PYTHONUTF8=1`，无需额外设置
-- 如果 `python` 命令打开 Microsoft Store，在 **Settings > Apps > App execution aliases** 中关闭 python.exe 和 python3.exe 的开关
 
 ### 验证安装
 
 ```bash
 cd ~/.claude/skills/video-to-canvas/scripts
 
-# 检查 Python
-.venv/Scripts/python.exe --version        # Windows
-.venv/bin/python --version                 # macOS/Linux
-
 # 检查核心依赖
-.venv/Scripts/python.exe -c "from google import genai; print('OK:', genai.__version__)"
+uv run python -c "from google import genai; print('OK:', genai.__version__)"
 
 # 检查 FFmpeg
 ffprobe -version
 
 # 检查 GPU（可选）
-.venv/Scripts/python.exe -c "import torch; print('CUDA:', torch.cuda.is_available())"
+uv run python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ```
 
 ## 使用

@@ -32,7 +32,18 @@ CHANGE_DETECTION_PROMPT = """
 输出要求：
 - 时间戳格式：MM:SS
 - 按时间升序排列
-- 每个变化点包含：时间戳、变化类型、简短描述
+- 每个变化点包含：时间戳、变化类型、详细描述
+
+**描述要求（重要！）**：
+description 字段必须包含画面中的**关键文字内容**：
+- 幻灯片标题和要点文字（原文抄写，不要概括）
+- 公式和数学表达式（用 LaTeX 格式）
+- 代码片段（关键行）
+- 图表的标签、坐标轴名称
+- 如果是图表/搜索树/状态图，描述其结构（如"3层搜索树，根节点S，子节点A/B/C"）
+- 动画的当前步骤和前后关系
+
+description 长度：30-100 字，宁长勿短。
 """
 
 # JSON Schema 强制输出格式
@@ -65,7 +76,7 @@ CHANGE_DETECTION_SCHEMA = {
                     },
                     "description": {
                         "type": "string",
-                        "description": "变化内容的简短描述（10-30字）"
+                        "description": "画面内容的详细描述，包含关键文字、公式、图表结构（30-100字）"
                     }
                 },
                 "required": ["timestamp", "change_type", "description"]

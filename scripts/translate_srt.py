@@ -19,16 +19,26 @@ except ImportError:
     print("Error: pip install google-genai")
     sys.exit(1)
 
-# 从 lore-engine/.env 加载 API Key
-LORE_ENGINE_ENV = os.path.expanduser("~/lore-engine/.env")
-if os.path.exists(LORE_ENGINE_ENV):
-    with open(LORE_ENGINE_ENV, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                if key.startswith("GEMINI_API_KEY") and key not in os.environ:
-                    os.environ[key] = value
+def _load_env_files():
+    """Load .env from skill directory, scripts dir, or legacy location"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    skill_dir = os.path.dirname(script_dir)
+    for env_path in [
+        os.path.join(skill_dir, ".env"),
+        os.path.join(script_dir, ".env"),
+        os.path.expanduser("~/lore-engine/.env"),
+    ]:
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, value = line.split("=", 1)
+                        key, value = key.strip(), value.strip()
+                        if key not in os.environ:
+                            os.environ[key] = value
+
+_load_env_files()
 
 
 def parse_srt(srt_text: str) -> list:

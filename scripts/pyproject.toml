@@ -1,0 +1,23 @@
+[project]
+name = "video-to-canvas"
+version = "2.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "google-genai>=1.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "faster-whisper>=1.0",
+    "ctranslate2==4.6.0",
+    "setuptools<81",
+    "torch>=2.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }

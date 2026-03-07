@@ -115,19 +115,36 @@ hooks:
 
 ### 执行步骤
 
-1. 运行 Python 脚本执行三阶段管道：
+1. **后台启动**三阶段管道（避免 Bash 10min 超时）：
    ```bash
-   cd ~/.claude/skills/video-to-canvas/scripts
-   PYTHONUTF8=1 .venv/Scripts/python.exe video_to_md.py "<视频路径>" -o "<输出目录>" --depth balanced
+   cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 nohup uv run python video_to_md.py "<视频路径>" -o "<输出目录>" --depth balanced --srt-lang zh > "<输出目录>/pipeline.log" 2>&1 &
    ```
 
-2. 等待执行完成，获取：
+2. **轮询进度**（每 30-60 秒检查一次 progress.json）：
+   ```bash
+   cat "<输出目录>/progress.json"
+   ```
+   progress.json 字段说明：
+   - `status`: `running` | `completed` | `failed`
+   - `stage`: `stage1` | `stage1.5` | `stage2` | `stage3` | `done`
+   - `stage_detail`: 当前阶段详细描述
+   - `error`: 失败时的错误信息
+
+3. 管道完成后（status=completed），获取输出文件：
    - `<输出目录>/<视频名>.md` - Markdown 笔记
    - `<输出目录>/screenshots/` - 截图目录
    - `<输出目录>/<视频名>_transcript.json` - 转录结果
    - `<输出目录>/<视频名>_changes.json` - 变化点信息
    - `<输出目录>/<视频名>.srt` - 英文字幕（精确时间戳，默认生成）
    - `<输出目录>/<视频名>.<lang>.srt` - 翻译字幕（使用 `--srt-lang` 时生成）
+
+### 恢复机制
+
+管道支持断点恢复。如果中途失败，只需重新运行同一命令：
+- `transcript.json` 已存在 → 跳过 Stage 1
+- `screenshots/` + `changes.json` 已存在 → 跳过 Stage 2
+- `chunks/chunk_N.json` 已存在 → Stage 3 跳过对应分段
+- `.srt` 文件已存在 → 跳过字幕生成
 
 ### 参数说明
 
@@ -395,14 +412,21 @@ Canvas 中的路径应为：
 布局: hierarchical (默认)
 ```
 
-### Step 2: 执行三阶段管道
+### Step 2: 后台启动三阶段管道
 
 ```bash
-cd ~/.claude/skills/video-to-canvas/scripts
-PYTHONUTF8=1 .venv/Scripts/python.exe video_to_md.py "<视频路径>" -o "<输出目录>" --depth <深度>
+cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 nohup uv run python video_to_md.py "<视频路径>" -o "<输出目录>" --depth <深度> --srt-lang zh > "<输出目录>/pipeline.log" 2>&1 &
 ```
 
-等待脚本完成，检查输出：
+### Step 2.5: 轮询进度（每 30-60 秒）
+
+```bash
+cat "<输出目录>/progress.json"
+```
+
+等待 `status` 变为 `completed`（或 `failed`）。如果失败，查看 `pipeline.log` 和 `error` 字段。
+
+完成后检查输出：
 - `<输出目录>/<视频名>.md` 存在
 - `<输出目录>/screenshots/` 目录有图片
 - `<输出目录>/<视频名>_transcript.json` 存在（如启用转录）

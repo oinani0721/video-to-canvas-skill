@@ -31,19 +31,33 @@ import sys
 import time
 import argparse
 import random
+import math
+import datetime
+import tempfile
 
-# 尝试从 lore-engine 的 .env 加载 API Key
-LORE_ENGINE_ENV = os.path.expanduser("~/lore-engine/.env")
-if os.path.exists(LORE_ENGINE_ENV):
-    with open(LORE_ENGINE_ENV, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                if key.startswith("GEMINI_API_KEY") and key not in os.environ:
-                    os.environ[key] = value
+def _load_env_files():
+    """Load .env from skill directory, scripts dir, or legacy location"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    skill_dir = os.path.dirname(script_dir)
+    for env_path in [
+        os.path.join(skill_dir, ".env"),
+        os.path.join(script_dir, ".env"),
+        os.path.expanduser("~/lore-engine/.env"),
+    ]:
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, value = line.split("=", 1)
+                        key, value = key.strip(), value.strip()
+                        if key not in os.environ:
+                            os.environ[key] = value
+
+_load_env_files()
 
 from styles import STYLES, VIDEO_PRESETS, get_style_prompt, list_styles, list_presets
+from add_video_timestamps import convert_timestamps, add_video_embed
 from prompt_builder import (
     PromptBuilder,
     CHANGE_DETECTION_PROMPT,
@@ -59,6 +73,57 @@ from prompt_builder_v2 import (
 )
 from transcriber import transcribe, save_transcript, load_transcript, TranscriptResult
 from srt_generator import generate_srt_from_transcript, translate_srt_file
+import shutil
+
+
+def preflight_check():
+    """Validate prerequisites before running the pipeline. Fail fast with actionable errors."""
+    errors = []
+    warnings = []
+
+    # Fatal: FFmpeg/ffprobe
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        errors.append("FFmpeg/ffprobe not found in PATH. Install: https://ffmpeg.org/download.html")
+
+    # Fatal: GEMINI_API_KEY
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY_1") or os.getenv("GOOGLE_AI_API_KEY")
+    if not api_key:
+        errors.append("GEMINI_API_KEY not set. Add it to ~/.claude/skills/video-to-canvas/.env")
+
+    # Warning: GPU
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            warnings.append("CUDA not available — whisper will use CPU (slower)")
+    except (ImportError, OSError, RuntimeError):
+        warnings.append("torch not installed — whisper will use CPU (slower)")
+
+    # Warning: faster-whisper
+    try:
+        import faster_whisper  # noqa: F401
+    except (ImportError, OSError):
+        warnings.append("faster-whisper not available — will use Gemini cloud transcription")
+
+    # Warning: disk space
+    try:
+        usage = shutil.disk_usage(os.getcwd())
+        free_gb = usage.free / (1024**3)
+        if free_gb < 1.0:
+            warnings.append(f"Low disk space: {free_gb:.1f} GB free (recommend > 1 GB)")
+    except OSError:
+        pass
+
+    for w in warnings:
+        print(f"  [WARNING] {w}", flush=True)
+
+    if errors:
+        print("\n[PREFLIGHT FAILED]", flush=True)
+        for e in errors:
+            print(f"  [FATAL] {e}", flush=True)
+        sys.exit(1)
+
+    if warnings:
+        print()
 
 
 def get_video_duration(video_path: str) -> float:
@@ -76,6 +141,82 @@ def get_video_duration(video_path: str) -> float:
     except (ValueError, FileNotFoundError):
         pass
     return 0.0
+
+
+def _split_video_segments(video_path: str, max_duration: int = 2100) -> list:
+    """
+    将视频分割为 ≤max_duration 秒的片段，用于分段上传 Gemini。
+    使用 -c copy 快速分割（无需重编码），耗时 <10 秒。
+
+    Args:
+        video_path: 视频文件路径
+        max_duration: 每段最大时长（秒），默认 2100 = 35 分钟
+
+    Returns:
+        [(segment_path, offset_seconds), ...]
+        如果视频不需要分割，返回 [(video_path, 0)]
+    """
+    duration = get_video_duration(video_path)
+    if duration <= 0:
+        print(f"  [Split] Cannot determine duration, uploading whole video")
+        return [(video_path, 0)]
+
+    if duration <= max_duration:
+        print(f"  [Split] Video {duration/60:.1f}min ≤ {max_duration/60:.0f}min limit, no split needed")
+        return [(video_path, 0)]
+
+    num_segments = math.ceil(duration / max_duration)
+    segment_duration = duration / num_segments
+
+    print(f"  [Split] Video {duration/60:.1f}min → {num_segments} segments "
+          f"(~{segment_duration/60:.1f}min each)")
+
+    segments = []
+    for i in range(num_segments):
+        offset = i * segment_duration
+        seg_path = tempfile.mktemp(suffix=f'_seg{i}.mp4')
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(offset),
+            "-i", video_path,
+            "-t", str(segment_duration),
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            seg_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg segment split failed: {result.stderr[:300]}")
+
+        seg_size_mb = os.path.getsize(seg_path) / (1024 * 1024)
+        print(f"    Segment {i+1}/{num_segments}: offset={offset/60:.1f}min, "
+              f"size={seg_size_mb:.1f}MB")
+        segments.append((seg_path, offset))
+
+    return segments
+
+
+_progress_started_at = None
+
+
+def _update_progress(output_dir: str, stage: str, detail: str,
+                     status: str = "running", error: str = None):
+    """更新 progress.json，供 Claude 轮询监控进度"""
+    global _progress_started_at
+    if _progress_started_at is None:
+        _progress_started_at = datetime.datetime.now().isoformat()
+
+    progress_path = os.path.join(output_dir, "progress.json")
+    with open(progress_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "status": status,
+            "stage": stage,
+            "stage_detail": detail,
+            "started_at": _progress_started_at,
+            "updated_at": datetime.datetime.now().isoformat(),
+            "error": error
+        }, f, ensure_ascii=False, indent=2)
 
 
 def fill_coverage_gaps(change_points: list, video_duration: float, gap_interval: float = 30.0) -> list:
@@ -186,6 +327,17 @@ def validate_image_references(markdown_text: str, screenshot_dir: str) -> str:
     return cleaned
 
 
+def convert_timestamps_to_links(md_text: str) -> str:
+    """将纯文本时间戳 [MM:SS] 转为 Media Extended 可点击格式 [MM:SS]()"""
+    # 时间范围: [MM:SS-MM:SS] → [MM:SS]()-[MM:SS]()
+    pattern_range = r'\[(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–]\s*(\d{1,2}:\d{2}(?::\d{2})?)\](?!\()'
+    md_text = re.sub(pattern_range, r'[\1]()-[\2]()', md_text)
+    # 单时间戳: [MM:SS] 或 [HH:MM:SS]（排除已是链接的和图片引用的）
+    pattern_single = r'\[(\d{1,2}:\d{2}(?::\d{2})?)\](?!\()'
+    md_text = re.sub(pattern_single, r'[\1]()', md_text)
+    return md_text
+
+
 def parse_timestamp_to_seconds(timestamp: str) -> float:
     """将 MM:SS 或 HH:MM:SS 格式转换为秒数"""
     parts = timestamp.split(":")
@@ -197,9 +349,13 @@ def parse_timestamp_to_seconds(timestamp: str) -> float:
 
 
 def seconds_to_timestamp(seconds: float) -> str:
-    """将秒数转换为 MM:SS 格式"""
-    mins = int(seconds // 60)
-    secs = int(seconds % 60)
+    """将秒数转换为 MM:SS 或 HH:MM:SS 格式"""
+    total_secs = int(seconds)
+    hrs = total_secs // 3600
+    mins = (total_secs % 3600) // 60
+    secs = total_secs % 60
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
     return f"{mins:02d}:{secs:02d}"
 
 
@@ -260,50 +416,91 @@ def filter_change_points(change_points: list, min_interval: float = 2.0) -> list
     return filtered
 
 
-def phase1_detect_changes(client, video_file, density: str = "normal") -> dict:
+def phase1_detect_changes(client, video_path: str, density: str = "normal") -> dict:
     """
-    阶段1：Gemini 视觉检测变化点
+    Stage 2 (Eyes): 分段上传视频到 Gemini 进行视觉变化检测。
+    长视频（>35min）自动分割为多个片段分别上传，合并结果。
 
     Args:
         client: Gemini 客户端
-        video_file: 上传的视频文件
+        video_path: 视频文件路径（非 video_file 对象）
         density: 检测密度 (sparse/normal/dense)
 
     Returns:
-        包含 change_points 的字典
+        包含 change_points 和 video_summary 的字典
     """
-    # 根据密度调整提示词
     density_hints = {
         "sparse": "\n\n密度要求：每分钟 1-3 个变化点，只保留最重要的变化。",
         "normal": "\n\n密度要求：每分钟 3-6 个变化点，平衡覆盖度和精简度。",
         "dense": "\n\n密度要求：每分钟 6-12 个变化点，尽可能捕捉所有变化。"
     }
-
     prompt = CHANGE_DETECTION_PROMPT + density_hints.get(density, density_hints["normal"])
 
-    print("阶段 1: Gemini 视频分析 - 检测画面变化点...")
+    # 分割视频（≤35min/段，≈540K tokens，远低于 1M 限制）
+    segments = _split_video_segments(video_path, max_duration=2100)
 
-    response_text = _gemini_generate_with_retry(
-        client, "gemini-2.5-flash",
-        [video_file, prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=CHANGE_DETECTION_SCHEMA
+    all_change_points = []
+    video_summary = ""
+
+    for i, (seg_path, offset) in enumerate(segments):
+        print(f"\n[Stage 2] Segment {i+1}/{len(segments)}: uploading to Gemini...")
+
+        # 上传片段
+        video_file = client.files.upload(file=seg_path)
+        video_file = wait_for_processing(client, video_file)
+
+        # Gemini 变化检测
+        response_text = _gemini_generate_with_retry(
+            client, "gemini-2.5-flash",
+            [video_file, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=CHANGE_DETECTION_SCHEMA
+            )
         )
-    )
 
-    # 解析 JSON 响应
-    try:
-        result = json.loads(response_text)
-    except json.JSONDecodeError as e:
-        print(f"警告：JSON 解析失败，尝试修复...")
-        # 尝试提取 JSON
-        text = response_text.strip()
-        text = re.sub(r'^```json\s*', '', text)
-        text = re.sub(r'\s*```$', '', text)
-        result = json.loads(text)
+        # 解析 JSON 响应
+        try:
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            text = response_text.strip()
+            text = re.sub(r'^```json\s*', '', text)
+            text = re.sub(r'\s*```$', '', text)
+            result = json.loads(text)
 
-    return result
+        # 合并变化点（后续片段需加时间偏移）
+        seg_points = result.get("change_points", [])
+        if offset > 0:
+            for cp in seg_points:
+                ts_seconds = parse_timestamp_to_seconds(cp["timestamp"])
+                cp["timestamp"] = seconds_to_timestamp(ts_seconds + offset)
+
+        all_change_points.extend(seg_points)
+        print(f"  Segment {i+1}: {len(seg_points)} change points detected")
+
+        # 第一个片段的摘要作为整体摘要
+        if i == 0:
+            video_summary = result.get("video_summary", "")
+
+        # 清理上传的文件
+        try:
+            client.files.delete(name=video_file.name)
+        except Exception:
+            pass
+
+        # 清理临时分段文件
+        if seg_path != video_path:
+            try:
+                os.remove(seg_path)
+            except OSError:
+                pass
+
+    print(f"\n[Stage 2] Total: {len(all_change_points)} change points across {len(segments)} segments")
+
+    return {
+        "video_summary": video_summary,
+        "change_points": all_change_points
+    }
 
 
 def format_transcript_for_prompt(transcript_result: TranscriptResult, start: float = 0, end: float = float('inf')) -> str:
@@ -336,7 +533,8 @@ def phase2_generate_notes(
     depth: str = "balanced",
     transcript_result: TranscriptResult = None,
     segment_minutes: float = 15.0,
-    video_duration: float = 0.0
+    video_duration: float = 0.0,
+    output_dir: str = None
 ) -> str:
     """
     Stage 3 (Brain)：融合转录文本 + 截图生成高质量笔记
@@ -366,7 +564,7 @@ def phase2_generate_notes(
         return _generate_notes_segmented(
             client, screenshots, style, video_summary,
             use_v2, depth, transcript_result, segment_minutes,
-            video_duration
+            video_duration, output_dir
         )
 
     # 单段处理（视频较短或无转录）
@@ -414,6 +612,114 @@ def _gemini_generate_with_retry(client, model: str, contents: list, max_retries:
     raise RuntimeError("Gemini API 重试次数已耗尽")
 
 
+# 评估 JSON Schema（强制结构化输出）
+QUALITY_EVAL_SCHEMA = types.Schema(
+    type="OBJECT",
+    properties={
+        "coverage_score": types.Schema(type="INTEGER", description="转录内容覆盖率 1-10"),
+        "structure_score": types.Schema(type="INTEGER", description="知识结构组织质量 1-10"),
+        "depth_score": types.Schema(type="INTEGER", description="解释深度 1-10"),
+        "accuracy_score": types.Schema(type="INTEGER", description="内容准确性 1-10"),
+        "overall_score": types.Schema(type="INTEGER", description="综合评分 1-10"),
+        "missing_content": types.Schema(
+            type="ARRAY",
+            items=types.Schema(type="STRING"),
+            description="笔记中遗漏的关键内容列表"
+        ),
+        "structure_issues": types.Schema(
+            type="ARRAY",
+            items=types.Schema(type="STRING"),
+            description="结构组织问题列表"
+        ),
+        "hallucinations": types.Schema(
+            type="ARRAY",
+            items=types.Schema(type="STRING"),
+            description="可能的幻觉/不准确内容"
+        ),
+    },
+    required=["coverage_score", "structure_score", "depth_score",
+              "accuracy_score", "overall_score", "missing_content",
+              "structure_issues", "hallucinations"],
+)
+
+
+def _evaluate_notes_quality(client, notes: str, transcript_text: str) -> dict:
+    """评估笔记质量，返回结构化评分和改进建议"""
+    eval_prompt = f"""你是笔记质量评估专家。请对比原始转录文本和生成的笔记，评估笔记质量。
+
+## 评估标准
+- coverage_score: 转录中的知识点是否都出现在笔记中？(1=大量遗漏, 10=完全覆盖)
+- structure_score: 是否按知识结构组织而非时间流水账？(1=纯流水账, 10=完美知识树)
+- depth_score: 是否有足够的解释和推理？(1=只有标题, 10=深度解析)
+- accuracy_score: 内容是否准确无幻觉？(1=大量错误, 10=完全准确)
+- missing_content: 列出笔记中遗漏的关键知识点
+- structure_issues: 列出结构组织问题
+- hallucinations: 列出可能的幻觉内容
+
+## 原始转录文本
+{transcript_text}
+
+## 生成的笔记
+{notes}
+"""
+
+    response = _gemini_generate_with_retry(
+        client, "gemini-2.5-flash", [eval_prompt],
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+            response_schema=QUALITY_EVAL_SCHEMA,
+        )
+    )
+    return json.loads(response)
+
+
+def _supplement_notes(client, notes: str, eval_result: dict,
+                      transcript_text: str, screenshots: list) -> str:
+    """根据评估结果定向补全笔记"""
+    missing = eval_result.get("missing_content", [])
+    issues = eval_result.get("structure_issues", [])
+    hallucinations = eval_result.get("hallucinations", [])
+
+    supplement_prompt = f"""你是笔记修订专家。请根据以下问题修订笔记。
+
+## 需要修复的问题
+
+### 遗漏的内容（必须补充）
+{chr(10).join(f'- {m}' for m in missing) if missing else '无'}
+
+### 结构问题（需要调整）
+{chr(10).join(f'- {i}' for i in issues) if issues else '无'}
+
+### 幻觉内容（需要移除或修正）
+{chr(10).join(f'- {h}' for h in hallucinations) if hallucinations else '无'}
+
+## 修订规则
+1. 保留原笔记中质量好的部分
+2. 补充遗漏的知识点到合适的位置
+3. 修正结构问题（按知识领域组织，不按时间）
+4. 移除或修正幻觉内容
+5. 保留所有截图引用和时间戳
+6. 输出完整的修订后笔记
+
+## 原始转录文本（作为事实基准）
+{transcript_text}
+
+## 需要修订的笔记
+{notes}
+"""
+    images = []
+    for s in screenshots:
+        if os.path.exists(s["path"]):
+            with open(s["path"], "rb") as f:
+                images.append(types.Part.from_bytes(data=f.read(), mime_type="image/jpeg"))
+
+    return _gemini_generate_with_retry(
+        client, "gemini-2.5-flash", [*images, supplement_prompt],
+        config=types.GenerateContentConfig(temperature=0.2, top_p=0.9)
+    )
+
+
 def _generate_notes_single(
     client,
     screenshots: list,
@@ -421,7 +727,8 @@ def _generate_notes_single(
     video_summary: str,
     use_v2: bool,
     depth: str,
-    transcript_result: TranscriptResult = None
+    transcript_result: TranscriptResult = None,
+    is_continuation: bool = False
 ) -> str:
     """单段笔记生成（用于短视频或单个分段）"""
 
@@ -446,14 +753,27 @@ def _generate_notes_single(
         builder = (PromptBuilderV2()
                    .with_mode(mode)
                    .with_depth(depth)
-                   .with_hierarchy()
-                   .with_screenshots(screenshots))
+                   .with_hierarchy())
 
-        # 核心改进：注入转录文本
+        # 分段连贯性：非首段时禁止重复和过渡语
+        if is_continuation:
+            builder.with_continuity()
+
+        # 音频主干优先（双通道融合: 音频 > 视觉）
         if transcript_text:
             builder.with_transcript(transcript_text)
 
-        builder.with_inference().with_summary()
+        builder.with_inference()
+
+        # 截图作为辅助，在推理之后
+        builder.with_screenshots(screenshots)
+
+        builder.with_summary()
+
+        # lecture 模式：启用 LaTeX、表格、理解题（借鉴 Lore Engine TOOLS）
+        if mode == "lecture":
+            builder.with_latex().with_tables().with_tricky_questions()
+
         prompt = builder.build()
 
         if video_summary:
@@ -500,15 +820,22 @@ def _generate_notes_segmented(
     depth: str,
     transcript_result: TranscriptResult,
     segment_minutes: float,
-    video_duration: float = 0.0
+    video_duration: float = 0.0,
+    output_dir: str = None
 ) -> str:
     """
     分段笔记生成（用于长视频，避免 Gemini 幻觉）
 
     将视频按 segment_minutes 切分，每段独立生成笔记，最后合并。
-    video_duration 用于截断超出实际视频时长的 chunks（防止转录时长幻觉）。
+    每个 chunk 完成后立即保存到 chunks/ 目录，支持断点恢复。
     """
     chunks = transcript_result.get_chunks(max_duration=segment_minutes * 60)
+
+    # 准备 chunk 缓存目录
+    chunks_dir = None
+    if output_dir:
+        chunks_dir = os.path.join(output_dir, "chunks")
+        os.makedirs(chunks_dir, exist_ok=True)
 
     # 使用 ffprobe 时长截断超出实际视频时长的 chunks
     # 防止 Gemini Audio 幻觉导致的转录时长 > 实际视频时长
@@ -559,17 +886,38 @@ def _generate_notes_segmented(
             language=transcript_result.language
         )
 
+        # 检查该 chunk 是否已有缓存（断点恢复）
+        chunk_cache_path = os.path.join(chunks_dir, f"chunk_{i}.json") if chunks_dir else None
+        if chunk_cache_path and os.path.exists(chunk_cache_path):
+            with open(chunk_cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            segment_notes = cached["notes"]
+            all_notes.append(segment_notes)
+            print(f"    [Cache] Chunk {i+1} loaded from cache")
+            continue
+
         # 生成该段笔记（分段间预防性延迟避免速率限制）
         if i > 0:
             print(f"    [Cooldown] 分段间等待 10s 避免速率限制...")
             time.sleep(10)
 
+        if output_dir:
+            _update_progress(output_dir, "stage3",
+                             f"Stage 3: Generating chunk {i+1}/{total_chunks}...")
+
         segment_notes = _generate_notes_single(
             client, chunk_screenshots, style,
             video_summary if i == 0 else "",  # 只在第一段加摘要
-            use_v2, depth, chunk_transcript
+            use_v2, depth, chunk_transcript,
+            is_continuation=(i > 0)
         )
         all_notes.append(segment_notes)
+
+        # 立即保存 chunk（防止中断丢失）
+        if chunk_cache_path:
+            with open(chunk_cache_path, "w", encoding="utf-8") as f:
+                json.dump({"chunk_index": i, "notes": segment_notes}, f, ensure_ascii=False)
+
         print(f"    分段 {i+1}/{total_chunks} 完成")
 
     # 合并所有分段笔记
@@ -582,20 +930,29 @@ def _generate_notes_segmented(
     merge_prompt = f"""你是笔记合并专家。以下是同一个视频的 {total_chunks} 个分段笔记，
 请将它们合并为一份结构完整、无重复的笔记。
 
-合并规则：
-1. 保留所有知识点，不要遗漏
-2. 去除分段边界处的重复内容
-3. 重新组织为统一的章节结构
-4. 保留所有截图引用
-5. 保留所有时间戳
-6. 输出使用中文，技术术语保留英文
+## 合并规则
+1. **知识结构优先**：按知识领域重新组织，不是简单拼接分段
+2. **零遗漏**：保留所有知识点、截图引用、时间戳
+3. **去重**：分段边界处的重复内容只保留一份
+4. **统一结构**：使用 # → ## → ### → #### 层级，主题章节约 5-10 个
+5. **保留截图**：确保所有 ![...](...) 图片引用完整保留
+6. **保留时间戳**：所有 [MM:SS]() 格式的时间戳必须保留
+7. **输出使用中文**，技术术语保留英文
+
+## 输出要求
+- 直接输出合并后的 Markdown，不要包含元描述
+- 不要写"以下是合并后的笔记"等前言
 
 """
     for i, notes in enumerate(all_notes):
         merge_prompt += f"\n{'='*40}\n## 分段 {i+1}\n{'='*40}\n{notes}\n"
 
     return _gemini_generate_with_retry(
-        client, "gemini-2.5-flash", [merge_prompt]
+        client, "gemini-2.5-flash", [merge_prompt],
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            top_p=0.85,
+        )
     )
 
 
@@ -618,6 +975,12 @@ def main(
     generate_srt: bool = True,
     srt_translate_lang: str = None
 ):
+    # 自动风格检测：文件名含 lecture/lec → 使用 lecture 模式
+    video_basename = os.path.basename(video_path).lower()
+    if style == "tutorial" and any(kw in video_basename for kw in ["lecture", "lec", "讲座", "讲课"]):
+        style = "lecture"
+        print(f"[Auto-detect] 检测到讲座视频，自动切换为 lecture 模式")
+
     """
     三阶段混合管道主函数
 
@@ -640,6 +1003,9 @@ def main(
         generate_srt: 是否生成 SRT 字幕文件（默认 True）
         srt_translate_lang: SRT 翻译目标语言（如 "zh"），None 则不翻译
     """
+    # Preflight: validate prerequisites before anything else
+    preflight_check()
+
     # 检查视频文件
     if not os.path.exists(video_path):
         print(f"错误：视频文件不存在: {video_path}")
@@ -668,14 +1034,46 @@ def main(
     screenshot_dir = os.path.join(output_dir, "screenshots")
     os.makedirs(screenshot_dir, exist_ok=True)
 
+    # 预计算视频名（用于恢复检查）
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+
+    # 初始化进度追踪
+    _update_progress(output_dir, "init", "Pipeline starting...")
+
+    # ========== 恢复检查 (Fix 6) ==========
+    # 自动检测输出目录中已有的文件，跳过已完成的阶段
+    transcript_json_path = os.path.join(output_dir, f"{video_name}_transcript.json")
+    changes_json_path = os.path.join(output_dir, f"{video_name}_changes.json")
+
+    if not transcript_path and os.path.exists(transcript_json_path):
+        transcript_path = transcript_json_path
+        print(f"[Resume] Found existing transcript: {transcript_json_path}")
+
+    skip_stage2 = False
+    saved_change_points = None
+    if os.path.exists(changes_json_path) and os.path.isdir(screenshot_dir):
+        existing_screenshots = [f for f in os.listdir(screenshot_dir) if f.endswith('.jpg')]
+        if existing_screenshots:
+            print(f"[Resume] Found existing changes.json + {len(existing_screenshots)} screenshots")
+            try:
+                with open(changes_json_path, "r", encoding="utf-8") as f:
+                    saved_data = json.load(f)
+                saved_change_points = saved_data.get("change_points", [])
+                if saved_change_points:
+                    skip_stage2 = True
+                    print(f"[Resume] Will skip Stage 2 ({len(saved_change_points)} change points)")
+            except (json.JSONDecodeError, KeyError):
+                pass
+
     # ========== Stage 1 (Ears): 音频转录 ==========
+    _update_progress(output_dir, "stage1", "Stage 1: Audio transcription...")
     transcript_result = None
     if transcribe_audio:
         if transcript_path and os.path.exists(transcript_path):
-            # 加载已有转录
-            print(f"\n加载已有转录: {transcript_path}")
+            # 加载已有转录（恢复或用户指定）
+            print(f"\n[Stage 1] Loading existing transcript: {transcript_path}")
             transcript_result = load_transcript(transcript_path)
-            print(f"  片段数: {len(transcript_result.segments)}, 后端: {transcript_result.backend}")
+            print(f"  Segments: {len(transcript_result.segments)}, Backend: {transcript_result.backend}")
         else:
             transcript_result = transcribe(
                 video_path=video_path,
@@ -684,50 +1082,64 @@ def main(
                 gemini_client=client if transcribe_backend in ("auto", "gemini") else None
             )
             # 保存转录结果
-            video_name_for_transcript = os.path.splitext(os.path.basename(video_path))[0]
-            transcript_save_path = os.path.join(output_dir, f"{video_name_for_transcript}_transcript.json")
+            transcript_save_path = os.path.join(output_dir, f"{video_name}_transcript.json")
             save_transcript(transcript_result, transcript_save_path)
     else:
-        print("\n[Stage 1: Ears] 已跳过音频转录 (--no-transcribe)")
+        print("\n[Stage 1: Ears] Skipped (--no-transcribe)")
+
+    _update_progress(output_dir, "stage1", "Stage 1 complete")
 
     # ========== Stage 1.5: 生成 SRT 字幕文件 ==========
+    _update_progress(output_dir, "stage1.5", "Stage 1.5: SRT generation...")
     srt_paths = {}
     if transcript_result and generate_srt:
-        video_name_for_srt = os.path.splitext(os.path.basename(video_path))[0]
-        srt_path = os.path.join(output_dir, f"{video_name_for_srt}.srt")
+        srt_path = os.path.join(output_dir, f"{video_name}.srt")
 
-        print(f"\n[Stage 1.5: SRT] Generating subtitles...")
-        generate_srt_from_transcript(transcript_result, srt_path)
-        srt_paths["en"] = srt_path
-        print(f"  SRT: {srt_path} ({len(transcript_result.segments)} segments)")
-        print(f"  Backend: {transcript_result.backend} (timestamps {'accurate' if transcript_result.backend == 'faster-whisper' else 'may need offset'})")
+        # Fix 7: SRT 缓存 — 已存在则跳过
+        if os.path.exists(srt_path):
+            print(f"\n[Stage 1.5] SRT already exists, skipping: {srt_path}")
+            srt_paths["en"] = srt_path
+        else:
+            print(f"\n[Stage 1.5: SRT] Generating subtitles...")
+            generate_srt_from_transcript(transcript_result, srt_path)
+            srt_paths["en"] = srt_path
+            print(f"  SRT: {srt_path} ({len(transcript_result.segments)} segments)")
 
-        # 翻译字幕
+        # 翻译字幕（也检查缓存）
         if srt_translate_lang:
             translated_srt_path = os.path.join(
-                output_dir, f"{video_name_for_srt}.{srt_translate_lang}.srt"
+                output_dir, f"{video_name}.{srt_translate_lang}.srt"
             )
-            print(f"  Translating to {srt_translate_lang}...")
-            result = translate_srt_file(
-                srt_path, translated_srt_path, srt_translate_lang,
-                gemini_client=client
-            )
-            if result:
-                srt_paths[srt_translate_lang] = result
+            if os.path.exists(translated_srt_path):
+                print(f"  [Cache] Translated SRT exists: {translated_srt_path}")
+                srt_paths[srt_translate_lang] = translated_srt_path
+            else:
+                print(f"  Translating to {srt_translate_lang}...")
+                result = translate_srt_file(
+                    srt_path, translated_srt_path, srt_translate_lang,
+                    gemini_client=client
+                )
+                if result:
+                    srt_paths[srt_translate_lang] = result
 
-    # ========== Stage 2 (Eyes): 上传视频 + 视觉检测 ==========
-    print(f"\n正在上传视频: {video_path}")
-    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-    print(f"  文件大小: {file_size_mb:.1f} MB")
+    # ========== Stage 2 (Eyes): 视觉检测 ==========
+    _update_progress(output_dir, "stage2", "Stage 2: Visual change detection...")
 
-    video_file = client.files.upload(file=video_path)
-    print("上传完成，正在等待处理...")
-    video_file = wait_for_processing(client, video_file)
-    print("视频处理完成！")
+    if skip_stage2:
+        # 恢复模式：使用已有的变化点
+        change_points = saved_change_points
+        video_summary = ""
+        print(f"\n[Stage 2] Resumed: {len(change_points)} change points from cache")
+    elif fusion:
+        # 双通道融合模式需要整体上传视频
+        print(f"\n[Stage 2] Uploading video for fusion mode: {video_path}")
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        print(f"  File size: {file_size_mb:.1f} MB")
 
-    # ========== Stage 2 (Eyes): 变化检测 ==========
-    if fusion:
-        # 双通道融合模式：视觉 + 语义交叉验证
+        video_file = client.files.upload(file=video_path)
+        print("  Upload complete, waiting for processing...")
+        video_file = wait_for_processing(client, video_file)
+
         from fusion_detector import FusionDetector, analyze_detection_quality
 
         print("\n[融合模式] 启用双通道交叉验证")
@@ -739,11 +1151,9 @@ def main(
             min_confidence=min_confidence
         )
 
-        # 转换为兼容格式
         change_points = detector.to_legacy_format()
         video_summary = ""
 
-        # 输出分析结果
         analysis = analyze_detection_quality(
             detector.visual_points,
             detector.semantic_points,
@@ -753,8 +1163,8 @@ def main(
         for suggestion in analysis.get("suggestions", []):
             print(f"  建议: {suggestion}")
     else:
-        # 单通道模式：仅视觉检测
-        result = phase1_detect_changes(client, video_file, density)
+        # 单通道模式：分段上传 + 视觉检测
+        result = phase1_detect_changes(client, video_path, density)
         change_points = result.get("change_points", [])
         video_summary = result.get("video_summary", "")
 
@@ -799,16 +1209,49 @@ def main(
             })
 
     # ========== Stage 3 (Brain): 笔记生成 ==========
+    _update_progress(output_dir, "stage3", "Stage 3: Generating notes...")
     markdown_text = phase2_generate_notes(
         client, screenshots, style, video_summary,
         use_v2=use_v2, depth=depth,
         transcript_result=transcript_result,
         segment_minutes=segment_minutes,
-        video_duration=video_duration
+        video_duration=video_duration,
+        output_dir=output_dir
     )
 
+    # ========== 质量评估循环 ==========
+    QUALITY_THRESHOLD = 7
+    if transcript_result:
+        transcript_for_eval = format_transcript_for_prompt(transcript_result)
+        print(f"\n[Quality] 评估笔记质量...")
+        eval_result = _evaluate_notes_quality(client, markdown_text, transcript_for_eval)
+
+        overall = eval_result.get("overall_score", 10)
+        print(f"[Quality] 评分: 覆盖={eval_result.get('coverage_score')}, "
+              f"结构={eval_result.get('structure_score')}, "
+              f"深度={eval_result.get('depth_score')}, "
+              f"准确={eval_result.get('accuracy_score')}, "
+              f"综合={overall}")
+
+        if overall < QUALITY_THRESHOLD:
+            missing_count = len(eval_result.get("missing_content", []))
+            issue_count = len(eval_result.get("structure_issues", []))
+            print(f"[Quality] 综合评分 {overall} < {QUALITY_THRESHOLD}，启动定向补全... "
+                  f"(缺失: {missing_count}, 结构问题: {issue_count})")
+            markdown_text = _supplement_notes(
+                client, markdown_text, eval_result, transcript_for_eval, screenshots
+            )
+            print(f"[Quality] 补全完成")
+        else:
+            print(f"[Quality] 质量达标，跳过补全")
+
+        # 保存评估结果
+        eval_path = os.path.join(output_dir, f"{video_name}_quality.json")
+        with open(eval_path, "w", encoding="utf-8") as f:
+            json.dump(eval_result, f, ensure_ascii=False, indent=2)
+
     # ========== 保存结果 ==========
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    _update_progress(output_dir, "saving", "Saving results...")
     md_path = os.path.join(output_dir, f"{video_name}.md")
 
     # 添加头部信息
@@ -842,6 +1285,62 @@ def main(
     # 后处理 2：验证图片引用，移除指向不存在文件的引用
     # 解决 Gemini 幻觉生成超出视频实际时长的截图引用
     markdown_text = validate_image_references(markdown_text, screenshot_dir)
+
+    # 后处理 3：修复未关闭的代码块（Lore Engine markdown_utils 移植）
+    lines = markdown_text.split('\n')
+    in_code = False
+    for line in lines:
+        if line.strip().startswith('```'):
+            in_code = not in_code
+    if in_code:
+        markdown_text += '\n```\n'
+        print("[后处理 3] 修复了未关闭的代码块")
+
+    # 后处理 4：压缩连续 3+ 空行为 2 空行
+    markdown_text = re.sub(r'\n{4,}', '\n\n\n', markdown_text)
+
+    # 后处理 4.5：修复伪代码语言标注（Gemini 常将伪代码标为 ```python）
+    pseudocode_markers = [
+        r'function ', r'procedure ', r'for each', r'if .* then',
+        r'←', r':=', r'while .* do', r'end for', r'end if',
+        r'end while', r'end function', r'end procedure',
+    ]
+    pp_lines = markdown_text.split('\n')
+    pp_result = []
+    pp_i = 0
+    while pp_i < len(pp_lines):
+        line = pp_lines[pp_i]
+        m = re.match(r'^(\s*)```(\w+)\s*$', line)
+        if m:
+            indent, lang = m.group(1), m.group(2)
+            # 收集 block 内容直到关闭
+            block_lines = []
+            j = pp_i + 1
+            while j < len(pp_lines) and not pp_lines[j].strip().startswith('```'):
+                block_lines.append(pp_lines[j])
+                j += 1
+            block_text = '\n'.join(block_lines)
+            # 判断是否是伪代码（>=2 个伪代码特征匹配）
+            hits = sum(1 for p in pseudocode_markers
+                       if re.search(p, block_text, re.IGNORECASE))
+            if hits >= 2:
+                pp_result.append(f'{indent}```')
+                print(f"[后处理 4.5] 修复伪代码语言标注: ```{lang} → ```")
+            else:
+                pp_result.append(line)
+            pp_i += 1
+        else:
+            pp_result.append(line)
+            pp_i += 1
+    markdown_text = '\n'.join(pp_result)
+
+    # 后处理 5：转换时间戳为 Media Extended 可点击格式
+    video_filename = os.path.basename(video_path)
+    print(f"\n[后处理 5] 转换时间戳为 Media Extended 格式...")
+    markdown_text = convert_timestamps(markdown_text, video_filename)
+
+    # 后处理 6：在笔记顶部添加视频嵌入
+    header = add_video_embed(header, video_filename)
 
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(header + markdown_text)
@@ -880,6 +1379,8 @@ def main(
         print(f"   架构: V1")
         print(f"   风格: {STYLES.get(style, {}).get('name', style)}")
     print(f"{'='*60}")
+
+    _update_progress(output_dir, "done", "Pipeline complete!", status="completed")
 
     return md_path
 
@@ -998,23 +1499,29 @@ if __name__ == "__main__":
     # 确定使用的架构
     use_v2 = not args.v1  # 默认 V2，除非指定 --v1
 
-    # 运行主函数
-    main(
-        video_path=args.video,
-        output_dir=args.output,
-        style=args.style,
-        preset=args.preset,
-        density=args.density,
-        min_interval=args.min_interval,
-        fusion=args.fusion,
-        min_confidence=args.min_confidence,
-        use_v2=use_v2,
-        depth=args.depth,
-        transcribe_audio=not args.no_transcribe,
-        transcribe_backend=args.backend,
-        whisper_model=args.whisper_model,
-        segment_minutes=args.segment_minutes,
-        transcript_path=args.transcript,
-        generate_srt=not args.no_srt,
-        srt_translate_lang=args.srt_lang
-    )
+    # 运行主函数（错误时写入 progress.json）
+    try:
+        main(
+            video_path=args.video,
+            output_dir=args.output,
+            style=args.style,
+            preset=args.preset,
+            density=args.density,
+            min_interval=args.min_interval,
+            fusion=args.fusion,
+            min_confidence=args.min_confidence,
+            use_v2=use_v2,
+            depth=args.depth,
+            transcribe_audio=not args.no_transcribe,
+            transcribe_backend=args.backend,
+            whisper_model=args.whisper_model,
+            segment_minutes=args.segment_minutes,
+            transcript_path=args.transcript,
+            generate_srt=not args.no_srt,
+            srt_translate_lang=args.srt_lang
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _update_progress(args.output, "error", str(e)[:500], status="failed", error=str(e))
+        sys.exit(1)
