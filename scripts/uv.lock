@@ -1052,7 +1052,7 @@ wheels = [
 
 [[package]]
 name = "video-to-canvas"
-version = "2.1.0"
+version = "2.4.0"
 source = { virtual = "." }
 dependencies = [
     { name = "google-genai" },

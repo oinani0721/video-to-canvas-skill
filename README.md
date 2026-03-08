@@ -238,21 +238,40 @@ output/
 
 ```
 video-to-canvas-skill/
-├── SKILL.md                    # 主 Skill 定义
-├── README.md                   # 本文档
-├── references/
-│   ├── json-canvas-spec.md    # JSON Canvas 格式规范
-│   └── v2-architecture.md     # V2 Lore Engine 架构说明
+├── SKILL.md                        # 主 Skill 定义（Claude Code 读取此文件）
+├── README.md                       # 本文档
+├── LICENSE                         # MIT License
+├── .env.example                    # 环境变量模板
+├── .gitignore
+├── commands/
+│   └── video-to-canvas.md          # Slash command 定义（复制到 ~/.claude/commands/）
 ├── config/
-│   └── default-config.json    # 默认配置
-├── scripts/
-│   ├── video_to_md.py         # Phase 1-3 执行脚本
-│   ├── prompt_builder_v2.py   # V2 提示词构建器
-│   ├── prompt_builder.py      # V1 提示词构建器
-│   ├── styles.py              # 笔记风格定义
-│   └── fusion_detector.py     # 双通道融合检测器
-└── sub-skills/                 # 子 Skill（可选）
+│   └── default-config.json         # 默认配置
+├── references/
+│   ├── json-canvas-spec.md         # JSON Canvas 格式规范
+│   └── v2-architecture.md          # V2 Lore Engine 架构说明
+└── scripts/
+    ├── pyproject.toml              # Python 依赖（uv sync --extra gpu）
+    ├── uv.lock                     # 依赖锁定（可复现安装）
+    ├── video_to_md.py              # 核心：三阶段混合管道主程序
+    ├── prompt_builder_v2.py        # V2 提示词构建器（11 层 Lore Engine 架构）
+    ├── prompt_builder.py           # V1 提示词构建器（变化检测用）
+    ├── transcriber.py              # Stage 1 (Ears)：音频转录（faster-whisper/Gemini）
+    ├── fusion_detector.py          # Stage 2 双通道融合检测器
+    ├── srt_generator.py            # SRT 字幕生成与翻译
+    ├── add_video_timestamps.py     # Media Extended 时间戳转换
+    └── styles.py                   # 笔记风格预设
 ```
+
+### Slash Command 安装
+
+除了将 skill 目录放到 `~/.claude/skills/video-to-canvas/`，还需将 slash command 复制到 Claude Code commands 目录：
+
+```bash
+cp commands/video-to-canvas.md ~/.claude/commands/
+```
+
+这样在 Claude Code 中输入 `/video-to-canvas` 即可触发 skill。
 
 ## 与其他工具的对比
 

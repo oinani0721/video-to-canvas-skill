@@ -496,6 +496,12 @@ TABLE_FORMATTING = """
 | UCS | 是 | 是 | $O(b^{C*/\\epsilon})$ | $O(b^{C*/\\epsilon})$ |
 
 *仅当所有边代价相同时
+
+注意：Obsidian 对表格内 LaTeX 的支持有限。
+- 简单公式可用 $...$：$O(b^d)$, $h(n)$ ✅
+- 复杂命令不要放在表格内：$3.6 \\times 10^6$ ❌
+- 改用 Unicode 符号：3.6 × 10⁶, ≤, ≥, → ✅
+- 复杂公式放在表格外用列表展开
 """
 
 TRICKY_QUESTIONS = """
@@ -533,6 +539,42 @@ AI_SUMMARY = """
 > - 最重要的 2-3 个知识点
 > - 对学习者的价值
 ```
+"""
+
+# ============================================================================
+# 教学脚手架（讲座模式核心质量保证）
+# ============================================================================
+
+TEACHING_SCAFFOLDING = """
+## 教学脚手架要求（讲座模式必须遵守！）
+
+### 1. 重点标注（blockquote）— 每个 ## 章节必须包含
+- 至少 1 个 `> 💡 **核心思想**`：总结该章节最重要的洞察
+- 适当数量的 `> ⚠️ **易错点**`：常见误解、容易犯错的地方
+- 教授强调的金句用 `> 📌 **关键**` 标注
+- 整篇笔记的 blockquote 总数不应少于 ## 章节数的 2 倍
+
+### 2. Worked Example（核心算法必须）
+每个核心算法/概念至少有 1 个完整的工作示例：
+- 明确的输入/初始状态
+- 逐步展示算法执行过程（标注每一步的选择和原因）
+- 最终结果和关键观察
+- 配合对应时间段的截图
+
+### 3. 概念对比（多概念时必须）
+当章节涉及 2 个以上可比较的概念/算法时：
+- 必须用表格列出关键差异（完备性/最优性/复杂度等维度）
+- 表格后用 2-3 句文字分析差异的原因和适用场景
+
+### 4. 章节过渡与总结
+- **过渡句**：章节之间用 1-2 句话连接逻辑（"基于 X 的局限性，我们引入 Y..."）
+- **小结**：每个 ## 章节末尾用 `> 📝 **小结**` 总结该章节的 2-3 个核心要点
+
+### 5. 内容密度下限
+- 每个 ### 子章节至少 8-15 行实质内容（不含空行和标题）
+- 混合使用段落文字和 bullet point，不要只有列表
+- 重要概念的完整链条：定义 → 直觉解释 → 形式化表达 → 示例应用
+- 避免"标题 + 3 行列表"的浅层模式
 """
 
 # ============================================================================
@@ -659,6 +701,11 @@ class PromptBuilderV2:
         self.parts.append(TRICKY_QUESTIONS)
         return self
 
+    def with_teaching_scaffolding(self) -> "PromptBuilderV2":
+        """启用教学脚手架（讲座模式推荐，确保 blockquote/examples/对比/总结）"""
+        self.parts.append(TEACHING_SCAFFOLDING)
+        return self
+
     def with_continuity(self) -> "PromptBuilderV2":
         """分段生成时禁止重复和过渡语句"""
         self.parts.append(CONTINUITY_RULES)
@@ -703,6 +750,7 @@ def create_lecture_notes_prompt(screenshots: list, transcript: str = "") -> str:
         builder.with_transcript(transcript)
     return (builder
             .with_inference()
+            .with_teaching_scaffolding()
             .with_summary()
             .build())
 

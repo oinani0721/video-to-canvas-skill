@@ -342,6 +342,233 @@ def validate_image_references(markdown_text: str, screenshot_dir: str) -> str:
     return cleaned
 
 
+# ========== 后处理：表格修复 ==========
+
+LATEX_TABLE_UNICODE = {
+    r'\times': '×', r'\cdot': '·', r'\leq': '≤', r'\le': '≤',
+    r'\geq': '≥', r'\ge': '≥', r'\neq': '≠', r'\ne': '≠',
+    r'\approx': '≈', r'\infty': '∞', r'\pm': '±',
+    r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+    r'\epsilon': 'ε', r'\theta': 'θ', r'\lambda': 'λ', r'\pi': 'π',
+    r'\sigma': 'σ', r'\mu': 'μ', r'\omega': 'ω',
+    r'\to': '→', r'\rightarrow': '→', r'\leftarrow': '←',
+    r'\Rightarrow': '⇒', r'\Leftarrow': '⇐',
+    r'\subset': '⊂', r'\subseteq': '⊆', r'\in': '∈',
+}
+
+
+def _sanitize_latex_in_cell(cell: str) -> str:
+    """将表格单元格中简单 LaTeX 替换为 Unicode，保留复杂公式"""
+    def replace_dollar(match):
+        content = match.group(1)
+        result = content
+        for latex_cmd, unicode_char in LATEX_TABLE_UNICODE.items():
+            result = result.replace(latex_cmd, unicode_char)
+        # 如果替换后不再有 \ 命令，剥除 $ 符号
+        if '\\' not in result:
+            return result
+        # 仍有复杂命令，保留 $...$
+        return f'${result}$'
+    return re.sub(r'\$([^$]+)\$', replace_dollar, cell)
+
+
+def fix_tables(markdown_text: str) -> str:
+    """修复 markdown 表格的渲染问题：LaTeX Unicode 化 + 结构验证"""
+    lines = markdown_text.split('\n')
+    result = []
+    i = 0
+    tables_fixed = 0
+
+    while i < len(lines):
+        # 检测表格起始（至少 2 行 | 开头，第 2 行是分隔符）
+        if (i + 1 < len(lines)
+                and lines[i].strip().startswith('|')
+                and lines[i + 1].strip().startswith('|')
+                and re.match(r'^\s*\|[\s:|-]+\|\s*$', lines[i + 1])):
+            # 收集整个表格块
+            table_start = i
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith('|'):
+                table_lines.append(lines[i])
+                i += 1
+
+            # 确定头部列数
+            header_cols = len(table_lines[0].split('|')) - 2  # 去掉首尾空
+            if header_cols < 1:
+                header_cols = len([c for c in table_lines[0].split('|') if c.strip()])
+
+            fixed_lines = []
+            for j, tl in enumerate(table_lines):
+                # LaTeX Unicode 化
+                cells = tl.split('|')
+                sanitized = []
+                for ci, cell in enumerate(cells):
+                    if ci == 0 or ci == len(cells) - 1:
+                        sanitized.append(cell)  # 保留首尾空
+                    elif j == 1:
+                        sanitized.append(cell)  # 分隔行不处理
+                    else:
+                        sanitized.append(_sanitize_latex_in_cell(cell))
+                fixed_line = '|'.join(sanitized)
+
+                # 列数修复：确保每行管道数一致
+                actual_cols = len(sanitized) - 2
+                if actual_cols > header_cols and j > 0:
+                    # 多余列：截断
+                    parts = fixed_line.split('|')
+                    fixed_line = '|'.join(parts[:header_cols + 1]) + '|'
+                elif actual_cols < header_cols and j > 0:
+                    # 缺少列：补空
+                    diff = header_cols - actual_cols
+                    fixed_line = fixed_line.rstrip('|') + '| ' * diff + '|'
+
+                fixed_lines.append(fixed_line)
+
+            result.extend(fixed_lines)
+            tables_fixed += 1
+        else:
+            result.append(lines[i])
+            i += 1
+
+    if tables_fixed > 0:
+        print(f"[后处理 4.1] 修复了 {tables_fixed} 个表格（LaTeX→Unicode + 结构验证）")
+    return '\n'.join(result)
+
+
+# ========== 后处理：截图分布修复 ==========
+
+def parse_timestamp_from_filename(filename: str) -> float:
+    """从截图文件名（如 '03-04.jpg' 或 'screenshots/01-15-08.jpg'）提取秒数"""
+    basename = os.path.basename(filename).replace('.jpg', '').replace('.png', '')
+    parts = basename.split('-')
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except (ValueError, IndexError):
+        pass
+    return 0
+
+
+def fix_screenshot_distribution(
+    markdown_text: str,
+    screenshot_dir: str,
+    screenshots: list,
+    min_gap_seconds: float = 180.0
+) -> str:
+    """补充无截图的长 section + 检测截图时间戳错配"""
+    lines = markdown_text.split('\n')
+
+    # Step 1: 解析 sections
+    ts_pattern = re.compile(r'\[(\d{1,2}:\d{2}(?::\d{2})?)\]')
+    img_pattern = re.compile(r'!\[.*?\]\((screenshots/[^)]+)\)')
+    sections = []
+    current = None
+
+    for li, line in enumerate(lines):
+        heading_match = re.match(r'^(#{2,3})\s+', line)
+        if heading_match:
+            if current is not None:
+                current['end_line'] = li
+                sections.append(current)
+            current = {
+                'heading': line, 'level': len(heading_match.group(1)),
+                'start_line': li, 'end_line': len(lines),
+                'timestamps': [], 'screenshots': []
+            }
+        if current is not None:
+            for ts_match in ts_pattern.finditer(line):
+                secs = parse_timestamp_to_seconds(ts_match.group(1))
+                if secs > 0:
+                    current['timestamps'].append(secs)
+            for img_match in img_pattern.finditer(line):
+                current['screenshots'].append(img_match.group(1))
+
+    if current is not None:
+        current['end_line'] = len(lines)
+        sections.append(current)
+
+    # Step 2: 构建截图清单
+    already_referenced = set()
+    for sec in sections:
+        already_referenced.update(sec['screenshots'])
+
+    all_available = {}
+    if os.path.isdir(screenshot_dir):
+        for fn in os.listdir(screenshot_dir):
+            if fn.endswith('.jpg') or fn.endswith('.png'):
+                rel_path = f"screenshots/{fn}"
+                ts_sec = parse_timestamp_from_filename(fn)
+                all_available[rel_path] = ts_sec
+
+    # 截图描述查找表
+    desc_lookup = {}
+    for ss in screenshots:
+        safe_ts = ss['timestamp'].replace(':', '-')
+        rel_path = f"screenshots/{safe_ts}.jpg"
+        desc_lookup[rel_path] = ss.get('desc', '')
+
+    unreferenced = {p: t for p, t in all_available.items() if p not in already_referenced}
+
+    # Step 3+4: 识别空白段 + 自动插入
+    inserted = 0
+    mismatches = 0
+    insert_ops = []  # (line_number, image_markdown)
+
+    for sec in sections:
+        if not sec['timestamps']:
+            continue
+        sec_start = min(sec['timestamps'])
+        sec_end = max(sec['timestamps'])
+        sec_span = sec_end - sec_start
+
+        # 错配检测 (Issue 3)
+        for ss_ref in sec['screenshots']:
+            if ss_ref in all_available:
+                ss_ts = all_available[ss_ref]
+                tolerance = 120
+                if ss_ts < sec_start - tolerance or ss_ts > sec_end + tolerance:
+                    print(f"  [Warning] Misplaced screenshot: {ss_ref} (ts={ss_ts:.0f}s) "
+                          f"in section [{sec_start:.0f}s-{sec_end:.0f}s]")
+                    mismatches += 1
+
+        # 空白段补图
+        if len(sec['screenshots']) == 0 and sec_span >= min_gap_seconds:
+            midpoint = (sec_start + sec_end) / 2
+            best_path = None
+            best_dist = float('inf')
+            for path, ts in unreferenced.items():
+                if sec_start - 30 <= ts <= sec_end + 30:
+                    dist = abs(ts - midpoint)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_path = path
+
+            if best_path:
+                desc = desc_lookup.get(best_path, '截图')
+                img_md = f"\n![{desc}]({best_path})\n"
+                # 在 heading 后的第一个非空内容行之后插入
+                insert_line = sec['start_line'] + 1
+                for k in range(sec['start_line'] + 1, min(sec['end_line'], sec['start_line'] + 5)):
+                    if k < len(lines) and lines[k].strip():
+                        insert_line = k + 1
+                        break
+                insert_ops.append((insert_line, img_md))
+                del unreferenced[best_path]
+                inserted += 1
+
+    # 按倒序插入避免行号偏移
+    insert_ops.sort(key=lambda x: x[0], reverse=True)
+    for line_no, img_md in insert_ops:
+        lines.insert(line_no, img_md)
+
+    if inserted > 0 or mismatches > 0:
+        print(f"[后处理 2.5] 截图分布: 插入 {inserted} 张, "
+              f"错配警告 {mismatches} 个, 未引用 {len(unreferenced)} 张")
+    return '\n'.join(lines)
+
+
 def convert_timestamps_to_links(md_text: str) -> str:
     """将纯文本时间戳 [MM:SS] 转为 Media Extended 可点击格式 [MM:SS]()"""
     # 时间范围: [MM:SS-MM:SS] → [MM:SS]()-[MM:SS]()
@@ -382,7 +609,7 @@ def extract_screenshot(video_path: str, timestamp: str, output_file: str) -> boo
         "-i", video_path,
         "-frames:v", "1",
         "-vf", "scale='min(1280,iw)':-2",
-        "-q:v", "5",
+        "-q:v", "2",
         output_file
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -631,6 +858,24 @@ def phase2_generate_notes(
     )
 
 
+class RateLimiter:
+    """线程安全的 API 调用速率限制器（匹配 v2.1.0 的 10s 间隔）"""
+    def __init__(self, min_interval: float = 10.0):
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+        self._min_interval = min_interval
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_call
+            if elapsed < self._min_interval:
+                sleep_time = self._min_interval - elapsed
+                print(f"    [Rate Limit] Waiting {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+            self._last_call = time.time()
+
+
 def _gemini_generate_with_retry(client, model: str, contents: list, max_retries: int = 5, **kwargs):
     """
     带指数退避重试的 Gemini API 调用，处理 429 速率限制错误。
@@ -677,6 +922,7 @@ QUALITY_EVAL_SCHEMA = types.Schema(
         "structure_score": types.Schema(type="INTEGER", description="知识结构组织质量 1-10"),
         "depth_score": types.Schema(type="INTEGER", description="解释深度 1-10"),
         "accuracy_score": types.Schema(type="INTEGER", description="内容准确性 1-10"),
+        "scaffolding_score": types.Schema(type="INTEGER", description="教学脚手架完整性 1-10 (blockquote/对比表/worked examples/总结)"),
         "overall_score": types.Schema(type="INTEGER", description="综合评分 1-10"),
         "missing_content": types.Schema(
             type="ARRAY",
@@ -688,6 +934,11 @@ QUALITY_EVAL_SCHEMA = types.Schema(
             items=types.Schema(type="STRING"),
             description="结构组织问题列表"
         ),
+        "scaffolding_issues": types.Schema(
+            type="ARRAY",
+            items=types.Schema(type="STRING"),
+            description="教学脚手架缺失项（如缺少blockquote/worked example/对比表/总结）"
+        ),
         "hallucinations": types.Schema(
             type="ARRAY",
             items=types.Schema(type="STRING"),
@@ -695,8 +946,9 @@ QUALITY_EVAL_SCHEMA = types.Schema(
         ),
     },
     required=["coverage_score", "structure_score", "depth_score",
-              "accuracy_score", "overall_score", "missing_content",
-              "structure_issues", "hallucinations"],
+              "accuracy_score", "scaffolding_score", "overall_score",
+              "missing_content", "structure_issues", "scaffolding_issues",
+              "hallucinations"],
 )
 
 
@@ -709,8 +961,11 @@ def _evaluate_notes_quality(client, notes: str, transcript_text: str) -> dict:
 - structure_score: 是否按知识结构组织而非时间流水账？(1=纯流水账, 10=完美知识树)
 - depth_score: 是否有足够的解释和推理？(1=只有标题, 10=深度解析)
 - accuracy_score: 内容是否准确无幻觉？(1=大量错误, 10=完全准确)
+- scaffolding_score: 教学脚手架是否完整？(1=纯文字无标注, 10=丰富的 blockquote/对比表/worked examples/总结)
+  检查项：每个 ## 章节是否有 💡核心思想 blockquote？是否有 ⚠️易错点？核心算法是否有 worked example？多概念是否有对比表？章节间是否有过渡句？
 - missing_content: 列出笔记中遗漏的关键知识点
 - structure_issues: 列出结构组织问题
+- scaffolding_issues: 列出教学脚手架缺失项（如"第3章缺少核心思想blockquote"、"A*算法缺少worked example"）
 - hallucinations: 列出可能的幻觉内容
 
 ## 原始转录文本
@@ -736,6 +991,7 @@ def _supplement_notes(client, notes: str, eval_result: dict,
     """根据评估结果定向补全笔记"""
     missing = eval_result.get("missing_content", [])
     issues = eval_result.get("structure_issues", [])
+    scaffolding = eval_result.get("scaffolding_issues", [])
     hallucinations = eval_result.get("hallucinations", [])
 
     supplement_prompt = f"""你是笔记修订专家。请根据以下问题修订笔记。
@@ -748,6 +1004,9 @@ def _supplement_notes(client, notes: str, eval_result: dict,
 ### 结构问题（需要调整）
 {chr(10).join(f'- {i}' for i in issues) if issues else '无'}
 
+### 教学脚手架缺失（必须补充！）
+{chr(10).join(f'- {s}' for s in scaffolding) if scaffolding else '无'}
+
 ### 幻觉内容（需要移除或修正）
 {chr(10).join(f'- {h}' for h in hallucinations) if hallucinations else '无'}
 
@@ -755,9 +1014,10 @@ def _supplement_notes(client, notes: str, eval_result: dict,
 1. 保留原笔记中质量好的部分
 2. 补充遗漏的知识点到合适的位置
 3. 修正结构问题（按知识领域组织，不按时间）
-4. 移除或修正幻觉内容
-5. 保留所有截图引用和时间戳
-6. 输出完整的修订后笔记
+4. **补充教学脚手架**：为每个 ## 章节添加缺失的 > 💡 核心思想、> ⚠️ 易错点 blockquote；为核心算法补充 worked examples；为多概念对比添加表格；为章节末尾添加 > 📝 小结
+5. 移除或修正幻觉内容
+6. 保留所有截图引用和时间戳
+7. 输出完整的修订后笔记
 
 ## 原始转录文本（作为事实基准）
 {transcript_text}
@@ -827,9 +1087,9 @@ def _generate_notes_single(
 
         builder.with_summary()
 
-        # lecture 模式：启用 LaTeX、表格、理解题（借鉴 Lore Engine TOOLS）
+        # lecture 模式：启用 LaTeX、表格、理解题、教学脚手架（借鉴 Lore Engine TOOLS）
         if mode == "lecture":
-            builder.with_latex().with_tables().with_tricky_questions()
+            builder.with_latex().with_tables().with_tricky_questions().with_teaching_scaffolding()
 
         prompt = builder.build()
 
@@ -918,6 +1178,7 @@ def _generate_notes_segmented(
     print(f"[Stage 3: Brain] 长视频分段模式: {total_chunks} 个分段 (每段 ≤{segment_minutes}min)")
 
     all_notes = [None] * total_chunks
+    rate_limiter = RateLimiter(min_interval=10.0)
 
     def _process_chunk(i, chunk):
         """处理单个 chunk：缓存检查 → 筛选数据 → 生成笔记 → 保存缓存"""
@@ -956,6 +1217,7 @@ def _generate_notes_segmented(
             _update_progress(output_dir, "stage3",
                              f"Stage 3: Generating chunk {i+1}/{total_chunks}...")
 
+        rate_limiter.wait()
         segment_notes = _generate_notes_single(
             client, chunk_screenshots, style,
             video_summary if i == 0 else "",
@@ -971,8 +1233,8 @@ def _generate_notes_segmented(
         print(f"    分段 {i+1}/{total_chunks} 完成")
         return (i, segment_notes)
 
-    # Chunk 并行生成（max_workers=3，Gemini 2.5 Flash 15RPM 下安全）
-    with ThreadPoolExecutor(max_workers=min(3, total_chunks)) as executor:
+    # Chunk 并行生成（2 workers + RateLimiter 保证 ≥10s 间隔）
+    with ThreadPoolExecutor(max_workers=min(2, total_chunks)) as executor:
         futures = {executor.submit(_process_chunk, i, chunk): i
                    for i, chunk in enumerate(chunks)}
         for future in as_completed(futures):
@@ -995,6 +1257,20 @@ def _generate_notes_segmented(
 
     print(f"\n[Stage 3: Brain] 合并 {total_chunks} 个分段笔记...")
 
+    # 统计输入截图引用总数，用于合并 prompt 的零丢失约束
+    total_ss_refs = sum(
+        len(re.findall(r'!\[.*?\]\(screenshots/[^)]+\)', n))
+        for n in all_notes if n
+    )
+    min_ss_refs = int(total_ss_refs * 0.9)
+
+    # 统计输入中的 blockquote 和教学元素数量
+    total_blockquotes = sum(
+        len(re.findall(r'^>[ ]', n, re.MULTILINE))
+        for n in all_notes if n
+    )
+    min_blockquotes = max(int(total_blockquotes * 0.9), 1)
+
     merge_prompt = f"""你是笔记合并专家。以下是同一个视频的 {total_chunks} 个分段笔记，
 请将它们合并为一份结构完整、无重复的笔记。
 
@@ -1003,9 +1279,13 @@ def _generate_notes_segmented(
 2. **零遗漏**：保留所有知识点、截图引用、时间戳
 3. **去重**：分段边界处的重复内容只保留一份
 4. **统一结构**：使用 # → ## → ### → #### 层级，主题章节约 5-10 个
-5. **保留截图**：确保所有 ![...](...) 图片引用完整保留
+5. **截图零丢失（最重要！）**：输入中共有 {total_ss_refs} 个截图引用，输出中不得少于 {min_ss_refs} 个。每个 ![...](screenshots/...) 引用的路径必须原样保留，绝不能删除。
 6. **保留时间戳**：所有 [MM:SS]() 格式的时间戳必须保留
-7. **输出使用中文**，技术术语保留英文
+7. **教学元素零丢失**：输入中共有约 {total_blockquotes} 个 blockquote（> 开头的行），输出中不得少于 {min_blockquotes} 个。
+   所有 `> 💡`、`> ⚠️`、`> 📌`、`> 📝` 格式的教学标注必须保留。
+   Worked examples（逐步求解过程）必须保留完整步骤，不得压缩为摘要。
+8. **内容详细度保持**：合并时不要将段落压缩为简短列表。每个 ### 子章节应保持原始分段中的详细程度。
+9. **输出使用中文**，技术术语保留英文
 
 ## 输出要求
 - 直接输出合并后的 Markdown，不要包含元描述
@@ -1015,6 +1295,7 @@ def _generate_notes_segmented(
     for i, notes in enumerate(all_notes):
         merge_prompt += f"\n{'='*40}\n## 分段 {i+1}\n{'='*40}\n{notes}\n"
 
+    rate_limiter.wait()
     merged_result = _gemini_generate_with_retry(
         client, "gemini-2.5-flash", [merge_prompt],
         config=types.GenerateContentConfig(
@@ -1322,17 +1603,27 @@ def main(
         eval_result = _evaluate_notes_quality(client, markdown_text, transcript_for_eval)
 
         overall = eval_result.get("overall_score", 10)
+        scaffolding = eval_result.get("scaffolding_score", 10)
         print(f"[Quality] 评分: 覆盖={eval_result.get('coverage_score')}, "
               f"结构={eval_result.get('structure_score')}, "
               f"深度={eval_result.get('depth_score')}, "
               f"准确={eval_result.get('accuracy_score')}, "
+              f"脚手架={scaffolding}, "
               f"综合={overall}")
 
-        if overall < QUALITY_THRESHOLD:
+        # 当综合评分低 OR 教学脚手架评分低时触发补全
+        needs_supplement = overall < QUALITY_THRESHOLD or scaffolding < QUALITY_THRESHOLD
+        if needs_supplement:
             missing_count = len(eval_result.get("missing_content", []))
             issue_count = len(eval_result.get("structure_issues", []))
-            print(f"[Quality] 综合评分 {overall} < {QUALITY_THRESHOLD}，启动定向补全... "
-                  f"(缺失: {missing_count}, 结构问题: {issue_count})")
+            scaffolding_count = len(eval_result.get("scaffolding_issues", []))
+            trigger_reason = []
+            if overall < QUALITY_THRESHOLD:
+                trigger_reason.append(f"综合={overall}")
+            if scaffolding < QUALITY_THRESHOLD:
+                trigger_reason.append(f"脚手架={scaffolding}")
+            print(f"[Quality] {' & '.join(trigger_reason)} < {QUALITY_THRESHOLD}，启动定向补全... "
+                  f"(缺失: {missing_count}, 结构问题: {issue_count}, 脚手架缺失: {scaffolding_count})")
             markdown_text = _supplement_notes(
                 client, markdown_text, eval_result, transcript_for_eval, screenshots
             )
@@ -1381,6 +1672,9 @@ def main(
     # 解决 Gemini 幻觉生成超出视频实际时长的截图引用
     markdown_text = validate_image_references(markdown_text, screenshot_dir)
 
+    # 后处理 2.5：截图分布修复（补充缺失截图 + 错配检测）
+    markdown_text = fix_screenshot_distribution(markdown_text, screenshot_dir, screenshots)
+
     # 后处理 3：修复未关闭的代码块（Lore Engine markdown_utils 移植）
     lines = markdown_text.split('\n')
     in_code = False
@@ -1393,6 +1687,9 @@ def main(
 
     # 后处理 4：压缩连续 3+ 空行为 2 空行
     markdown_text = re.sub(r'\n{4,}', '\n\n\n', markdown_text)
+
+    # 后处理 4.1：修复表格渲染（LaTeX→Unicode + 结构验证）
+    markdown_text = fix_tables(markdown_text)
 
     # 后处理 4.5：修复伪代码语言标注（Gemini 常将伪代码标为 ```python）
     pseudocode_markers = [
