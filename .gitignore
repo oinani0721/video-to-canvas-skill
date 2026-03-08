@@ -31,3 +31,10 @@ screenshots/
 
 # Logs
 *.log
+
+# Runtime state
+queue.json
+queue.log
+chunks/
+progress.json
+*_quality.json

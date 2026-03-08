@@ -46,6 +46,9 @@ hooks:
 /video-to-canvas video.mp4 --depth=deep_dive
 /video-to-canvas video.mp4 --no-transcribe     # 跳过转录（旧模式）
 /video-to-canvas video.mp4 --layout=mindmap
+
+# 批量队列模式（多个视频顺序处理）
+/video-to-canvas video1.mp4 video2.mp4 video3.mp4
 ```
 
 ---
@@ -470,6 +473,104 @@ cat "<输出目录>/progress.json"
 然后打开 .canvas 文件查看可视化笔记。
 SRT 字幕文件会被 Media Extended 插件自动检测（同名同目录）。
 ```
+
+---
+
+## 队列模式（批量处理多个视频）
+
+当用户提供多个视频路径时，使用队列模式顺序处理。
+
+### 队列流程
+
+```
+📹 video1.mp4  📹 video2.mp4  📹 video3.mp4
+     │               │               │
+     └───────────────┬───────────────┘
+                     ▼
+          ┌─────────────────────┐
+          │  queue_processor.py │
+          │  add → run --daemon │
+          │  顺序处理每个视频    │
+          └─────────────────────┘
+                     │
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+  [Stage 1-3]  [Stage 1-3]  [Stage 1-3]
+   video1 ✓     video2 ◉     video3 ○
+        │            │            │
+        ▼            ▼            ▼
+  [Phase 4]    [Phase 4]    [Phase 4]
+  Claude生成    Claude生成    Claude生成
+  Canvas       Canvas       Canvas
+```
+
+### Step Q1: 添加视频到队列
+
+```bash
+cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 uv run python queue_processor.py add "<视频1>" "<视频2>" "<视频3>" --depth balanced --srt-lang zh
+```
+
+### Step Q2: 后台启动队列处理
+
+```bash
+cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 uv run python queue_processor.py run --daemon
+```
+
+### Step Q3: 轮询队列进度
+
+```bash
+cat ~/.claude/skills/video-to-canvas/queue.json
+```
+
+queue.json 字段说明：
+- `status`: `idle` | `processing` | `completed`
+- `total`: 队列总数
+- `completed`: 已完成数
+- `failed`: 失败数
+- `current_index`: 当前正在处理的项目索引
+- `items[].status`: `pending` | `processing` | `completed` | `failed`
+
+轮询策略：
+- 每 60 秒检查一次 queue.json
+- 当某个 item 的 status 变为 `completed` 时，立即为其生成 Canvas（Phase 4）
+- 然后继续轮询等待下一个视频完成
+- 当 queue.status 变为 `completed` 时，所有视频处理完毕
+
+### Step Q4: 每个视频完成时生成 Canvas
+
+对于队列中每个 `completed` 的视频：
+1. 读取其 `<output>/<视频名>.md`
+2. 执行 Phase 4（分析 + 生成 Canvas）
+3. 写入 `<output>/<视频名>.canvas`
+
+> ⚠️ **重要**：Canvas 生成（Phase 4）在每个视频的管道完成后立即执行，不需要等待所有视频都完成。这样可以边处理边生成。
+
+### Step Q5: 处理中追加新视频
+
+用户可以在队列处理过程中追加新视频：
+```bash
+cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 uv run python queue_processor.py add "<新视频>"
+```
+队列处理器会在当前视频完成后自动热加载队列，开始处理新添加的视频。
+
+### Step Q6: 查看队列状态
+
+```bash
+cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 uv run python queue_processor.py status
+```
+
+### Step Q7: 清理队列
+
+```bash
+cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 uv run python queue_processor.py clear --completed
+```
+
+### 队列模式判断规则
+
+当用户调用 `/video-to-canvas` 时：
+- **单个视频路径** → 使用原有单视频流程（Step 1-6）
+- **多个视频路径** → 使用队列模式（Step Q1-Q7）
+- 路径中包含通配符（如 `*.mp4`）→ 先 glob 展开，然后使用队列模式
 
 ---
 
