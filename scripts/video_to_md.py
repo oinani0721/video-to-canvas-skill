@@ -34,6 +34,8 @@ import random
 import math
 import datetime
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def _load_env_files():
     """Load .env from skill directory, scripts dir, or legacy location"""
@@ -55,6 +57,12 @@ def _load_env_files():
                             os.environ[key] = value
 
 _load_env_files()
+
+# Fix: 确保 stdout/stderr 行缓冲，让 pipeline.log 实时输出
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(line_buffering=True)
 
 from styles import STYLES, VIDEO_PRESETS, get_style_prompt, list_styles, list_presets
 from add_video_timestamps import convert_timestamps, add_video_embed
@@ -198,25 +206,32 @@ def _split_video_segments(video_path: str, max_duration: int = 2100) -> list:
 
 
 _progress_started_at = None
+_progress_lock = threading.Lock()
 
 
 def _update_progress(output_dir: str, stage: str, detail: str,
-                     status: str = "running", error: str = None):
-    """更新 progress.json，供 Claude 轮询监控进度"""
+                     status: str = "running", error: str = None,
+                     parallel_stages: list = None):
+    """更新 progress.json，供 Claude 轮询监控进度（线程安全）"""
     global _progress_started_at
-    if _progress_started_at is None:
-        _progress_started_at = datetime.datetime.now().isoformat()
+    with _progress_lock:
+        if _progress_started_at is None:
+            _progress_started_at = datetime.datetime.now().isoformat()
 
-    progress_path = os.path.join(output_dir, "progress.json")
-    with open(progress_path, "w", encoding="utf-8") as f:
-        json.dump({
+        progress_data = {
             "status": status,
             "stage": stage,
             "stage_detail": detail,
             "started_at": _progress_started_at,
             "updated_at": datetime.datetime.now().isoformat(),
             "error": error
-        }, f, ensure_ascii=False, indent=2)
+        }
+        if parallel_stages:
+            progress_data["parallel_stages"] = parallel_stages
+
+        progress_path = os.path.join(output_dir, "progress.json")
+        with open(progress_path, "w", encoding="utf-8") as f:
+            json.dump(progress_data, f, ensure_ascii=False, indent=2)
 
 
 def fill_coverage_gaps(change_points: list, video_duration: float, gap_interval: float = 30.0) -> list:
@@ -366,22 +381,59 @@ def extract_screenshot(video_path: str, timestamp: str, output_file: str) -> boo
         "-ss", timestamp,
         "-i", video_path,
         "-frames:v", "1",
-        "-q:v", "2",
+        "-vf", "scale='min(1280,iw)':-2",
+        "-q:v", "5",
         output_file
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0
 
 
+def _extract_screenshots_parallel(video_path: str, change_points: list,
+                                   screenshot_dir: str, max_workers: int = 8) -> list:
+    """并行提取截图（I/O 密集型，ThreadPoolExecutor 加速）"""
+    print(f"正在提取截图（并行, {max_workers} workers）...")
+
+    def _extract_one(i, cp):
+        ts = cp["timestamp"]
+        safe_ts = ts.replace(":", "-")
+        output_file = os.path.join(screenshot_dir, f"{safe_ts}.jpg")
+        success = extract_screenshot(video_path, ts, output_file)
+        return i, ts, cp.get("description", "")[:30], cp.get("change_type", ""), success, output_file
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_extract_one, i, cp)
+                   for i, cp in enumerate(change_points)]
+        results = [f.result() for f in as_completed(futures)]
+
+    results.sort(key=lambda x: x[0])
+
+    screenshots = []
+    for i, ts, desc, change_type, success, output_file in results:
+        status = "[OK]" if success else "[FAIL]"
+        print(f"  [{i+1}/{len(change_points)}] {status} {ts} - {desc}")
+        if success:
+            screenshots.append({
+                "timestamp": ts,
+                "path": output_file,
+                "desc": desc,
+                "type": change_type
+            })
+    return screenshots
+
+
 def wait_for_processing(client, video_file, max_wait: int = 300):
-    """等待视频处理完成"""
+    """等待视频处理完成（自适应轮询间隔）"""
     start_time = time.time()
+    poll_interval = 2.0
+    max_interval = 10.0
     while video_file.state.name == "PROCESSING":
         elapsed = time.time() - start_time
         if elapsed > max_wait:
             raise TimeoutError(f"视频处理超时（>{max_wait}秒）")
         print(f"  视频处理中... ({int(elapsed)}s)")
-        time.sleep(5)
+        time.sleep(poll_interval)
+        poll_interval = min(poll_interval * 2, max_interval)
         video_file = client.files.get(name=video_file.name)
 
     if video_file.state.name == "FAILED":
@@ -442,24 +494,23 @@ def phase1_detect_changes(client, video_path: str, density: str = "normal") -> d
     all_change_points = []
     video_summary = ""
 
-    for i, (seg_path, offset) in enumerate(segments):
-        print(f"\n[Stage 2] Segment {i+1}/{len(segments)}: uploading to Gemini...")
+    def _process_segment(i, seg_path, offset):
+        """处理单个视频分段：上传 → 等待 → 检测 → 清理"""
+        seg_count = len(segments)
+        print(f"\n[Stage 2] Segment {i+1}/{seg_count}: uploading to Gemini...")
 
-        # 上传片段
-        video_file = client.files.upload(file=seg_path)
-        video_file = wait_for_processing(client, video_file)
+        vf = client.files.upload(file=seg_path)
+        vf = wait_for_processing(client, vf)
 
-        # Gemini 变化检测
         response_text = _gemini_generate_with_retry(
             client, "gemini-2.5-flash",
-            [video_file, prompt],
+            [vf, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=CHANGE_DETECTION_SCHEMA
             )
         )
 
-        # 解析 JSON 响应
         try:
             result = json.loads(response_text)
         except json.JSONDecodeError:
@@ -468,32 +519,38 @@ def phase1_detect_changes(client, video_path: str, density: str = "normal") -> d
             text = re.sub(r'\s*```$', '', text)
             result = json.loads(text)
 
-        # 合并变化点（后续片段需加时间偏移）
         seg_points = result.get("change_points", [])
         if offset > 0:
             for cp in seg_points:
                 ts_seconds = parse_timestamp_to_seconds(cp["timestamp"])
                 cp["timestamp"] = seconds_to_timestamp(ts_seconds + offset)
 
-        all_change_points.extend(seg_points)
-        print(f"  Segment {i+1}: {len(seg_points)} change points detected")
+        print(f"  Segment {i+1}/{seg_count}: {len(seg_points)} change points detected")
+        seg_summary = result.get("video_summary", "") if i == 0 else None
 
-        # 第一个片段的摘要作为整体摘要
-        if i == 0:
-            video_summary = result.get("video_summary", "")
-
-        # 清理上传的文件
         try:
-            client.files.delete(name=video_file.name)
+            client.files.delete(name=vf.name)
         except Exception:
             pass
 
-        # 清理临时分段文件
         if seg_path != video_path:
             try:
                 os.remove(seg_path)
             except OSError:
                 pass
+
+        return (i, seg_points, seg_summary)
+
+    # 分段并行处理（每段独立上传+检测，无共享可变状态）
+    with ThreadPoolExecutor(max_workers=min(3, len(segments))) as executor:
+        futures = [executor.submit(_process_segment, i, seg_path, offset)
+                   for i, (seg_path, offset) in enumerate(segments)]
+        results = [f.result() for f in futures]
+    results.sort(key=lambda x: x[0])
+    for _, seg_points, seg_summary in results:
+        all_change_points.extend(seg_points)
+        if seg_summary is not None:
+            video_summary = seg_summary
 
     print(f"\n[Stage 2] Total: {len(all_change_points)} change points across {len(segments)} segments")
 
@@ -860,9 +917,10 @@ def _generate_notes_segmented(
 
     print(f"[Stage 3: Brain] 长视频分段模式: {total_chunks} 个分段 (每段 ≤{segment_minutes}min)")
 
-    all_notes = []
+    all_notes = [None] * total_chunks
 
-    for i, chunk in enumerate(chunks):
+    def _process_chunk(i, chunk):
+        """处理单个 chunk：缓存检查 → 筛选数据 → 生成笔记 → 保存缓存"""
         chunk_start = chunk["start"]
         chunk_end = chunk["end"]
         chunk_duration = (chunk_end - chunk_start) / 60
@@ -870,6 +928,14 @@ def _generate_notes_segmented(
         print(f"\n  分段 {i+1}/{total_chunks}: "
               f"[{seconds_to_timestamp(chunk_start)} - {seconds_to_timestamp(chunk_end)}] "
               f"({chunk_duration:.1f}min)")
+
+        # 检查该 chunk 是否已有缓存（断点恢复）
+        chunk_cache_path = os.path.join(chunks_dir, f"chunk_{i}.json") if chunks_dir else None
+        if chunk_cache_path and os.path.exists(chunk_cache_path):
+            with open(chunk_cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            print(f"    [Cache] Chunk {i+1} loaded from cache")
+            return (i, cached["notes"])
 
         # 筛选该时间段内的截图
         chunk_screenshots = [
@@ -886,32 +952,16 @@ def _generate_notes_segmented(
             language=transcript_result.language
         )
 
-        # 检查该 chunk 是否已有缓存（断点恢复）
-        chunk_cache_path = os.path.join(chunks_dir, f"chunk_{i}.json") if chunks_dir else None
-        if chunk_cache_path and os.path.exists(chunk_cache_path):
-            with open(chunk_cache_path, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            segment_notes = cached["notes"]
-            all_notes.append(segment_notes)
-            print(f"    [Cache] Chunk {i+1} loaded from cache")
-            continue
-
-        # 生成该段笔记（分段间预防性延迟避免速率限制）
-        if i > 0:
-            print(f"    [Cooldown] 分段间等待 10s 避免速率限制...")
-            time.sleep(10)
-
         if output_dir:
             _update_progress(output_dir, "stage3",
                              f"Stage 3: Generating chunk {i+1}/{total_chunks}...")
 
         segment_notes = _generate_notes_single(
             client, chunk_screenshots, style,
-            video_summary if i == 0 else "",  # 只在第一段加摘要
+            video_summary if i == 0 else "",
             use_v2, depth, chunk_transcript,
             is_continuation=(i > 0)
         )
-        all_notes.append(segment_notes)
 
         # 立即保存 chunk（防止中断丢失）
         if chunk_cache_path:
@@ -919,12 +969,30 @@ def _generate_notes_segmented(
                 json.dump({"chunk_index": i, "notes": segment_notes}, f, ensure_ascii=False)
 
         print(f"    分段 {i+1}/{total_chunks} 完成")
+        return (i, segment_notes)
+
+    # Chunk 并行生成（max_workers=3，Gemini 2.5 Flash 15RPM 下安全）
+    with ThreadPoolExecutor(max_workers=min(3, total_chunks)) as executor:
+        futures = {executor.submit(_process_chunk, i, chunk): i
+                   for i, chunk in enumerate(chunks)}
+        for future in as_completed(futures):
+            idx, notes = future.result()
+            all_notes[idx] = notes
 
     # 合并所有分段笔记
     if total_chunks == 1:
         return all_notes[0]
 
-    # 多段合并：请 LLM 整合
+    # 多段合并：检查缓存或请 LLM 整合
+    merged_cache_path = os.path.join(chunks_dir, "merged.md") if chunks_dir else None
+    if merged_cache_path and os.path.exists(merged_cache_path):
+        cached_chunks = len([f for f in os.listdir(chunks_dir)
+                             if f.startswith("chunk_") and f.endswith(".json")])
+        if cached_chunks >= total_chunks:
+            with open(merged_cache_path, "r", encoding="utf-8") as f:
+                print(f"  [Cache] Merged notes loaded from cache")
+                return f.read()
+
     print(f"\n[Stage 3: Brain] 合并 {total_chunks} 个分段笔记...")
 
     merge_prompt = f"""你是笔记合并专家。以下是同一个视频的 {total_chunks} 个分段笔记，
@@ -947,13 +1015,20 @@ def _generate_notes_segmented(
     for i, notes in enumerate(all_notes):
         merge_prompt += f"\n{'='*40}\n## 分段 {i+1}\n{'='*40}\n{notes}\n"
 
-    return _gemini_generate_with_retry(
+    merged_result = _gemini_generate_with_retry(
         client, "gemini-2.5-flash", [merge_prompt],
         config=types.GenerateContentConfig(
             temperature=0.1,
             top_p=0.85,
         )
     )
+
+    # 缓存 merge 结果（resume 时跳过重复 API 调用）
+    if merged_cache_path:
+        with open(merged_cache_path, "w", encoding="utf-8") as f:
+            f.write(merged_result)
+
+    return merged_result
 
 
 def main(
@@ -1065,47 +1140,154 @@ def main(
             except (json.JSONDecodeError, KeyError):
                 pass
 
-    # ========== Stage 1 (Ears): 音频转录 ==========
-    _update_progress(output_dir, "stage1", "Stage 1: Audio transcription...")
+    # ========== 预计算视频时长（ffprobe，快速） ==========
+    video_duration = get_video_duration(video_path)
+
+    # ========== 确定需要运行的阶段 ==========
+    need_stage1 = transcribe_audio and not (transcript_path and os.path.exists(transcript_path))
+    need_stage2 = not skip_stage2
+
     transcript_result = None
-    if transcribe_audio:
-        if transcript_path and os.path.exists(transcript_path):
-            # 加载已有转录（恢复或用户指定）
+    change_points = None
+    video_summary = ""
+    screenshots = []
+
+    # ----- Stage 1 线程函数（本地 faster-whisper，无 API 调用） -----
+    def _do_stage1():
+        _update_progress(output_dir, "stage1", "Stage 1: Audio transcription...",
+                         parallel_stages=["stage1", "stage2"] if need_stage2 else None)
+        result = transcribe(
+            video_path=video_path,
+            backend=transcribe_backend,
+            model_size=whisper_model,
+            gemini_client=client if transcribe_backend in ("auto", "gemini") else None
+        )
+        save_transcript(result, os.path.join(output_dir, f"{video_name}_transcript.json"))
+        print("[Pipeline] Stage 1 complete")
+        return result
+
+    # ----- Stage 2 线程函数（Gemini API 视觉检测 + 截图） -----
+    def _do_stage2():
+        _update_progress(output_dir, "stage2", "Stage 2: Visual change detection...",
+                         parallel_stages=["stage1", "stage2"] if need_stage1 else None)
+        if fusion:
+            print(f"\n[Stage 2] Uploading video for fusion mode: {video_path}")
+            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+            print(f"  File size: {file_size_mb:.1f} MB")
+            video_file = client.files.upload(file=video_path)
+            print("  Upload complete, waiting for processing...")
+            video_file = wait_for_processing(client, video_file)
+            from fusion_detector import FusionDetector, analyze_detection_quality
+            print("\n[融合模式] 启用双通道交叉验证")
+            detector = FusionDetector(client, video_file)
+            detector.detect_and_fuse(
+                visual_prompt=CHANGE_DETECTION_PROMPT,
+                visual_schema=CHANGE_DETECTION_SCHEMA,
+                min_confidence=min_confidence
+            )
+            cp = detector.to_legacy_format()
+            vs = ""
+            analysis = analyze_detection_quality(
+                detector.visual_points, detector.semantic_points, detector.fused_points
+            )
+            print(f"\n[分析] 匹配率: {analysis['fused_ratio']:.1%}")
+            for suggestion in analysis.get("suggestions", []):
+                print(f"  建议: {suggestion}")
+        else:
+            result = phase1_detect_changes(client, video_path, density)
+            cp = result.get("change_points", [])
+            vs = result.get("video_summary", "")
+
+        print(f"检测到 {len(cp)} 个原始变化点")
+        cp = filter_change_points(cp, min_interval)
+        print(f"过滤后保留 {len(cp)} 个变化点（最小间隔: {min_interval}s）")
+        if not cp:
+            print("警告：未检测到有效变化点，使用备用策略...")
+            cp = [{"timestamp": "00:00", "change_type": "other", "description": "视频开始"}]
+
+        # Stage 2.5: 覆盖率检查 + 自动补充
+        vd = video_duration
+        if vd > 0:
+            cp = fill_coverage_gaps(cp, vd, gap_interval=30.0)
+
+        # 并行截图提取
+        ss = _extract_screenshots_parallel(video_path, cp, screenshot_dir)
+        print(f"[Pipeline] Stage 2 complete ({len(ss)} screenshots)")
+        return cp, vs, ss
+
+    # ========== Stage 1 & Stage 2: 并行或顺序执行 ==========
+    if need_stage1 and need_stage2:
+        # ===== 并行模式: Stage 1 (LOCAL) + Stage 2 (API) 同时运行 =====
+        print("\n[Pipeline] PARALLEL mode: Stage 1 + Stage 2 running simultaneously")
+        print("  Thread A: Stage 1 (local faster-whisper)")
+        print("  Thread B: Stage 2 (Gemini API visual detection)")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_s1 = executor.submit(_do_stage1)
+            future_s2 = executor.submit(_do_stage2)
+            errors = {}
+            for future in as_completed([future_s1, future_s2]):
+                try:
+                    if future is future_s1:
+                        transcript_result = future.result()
+                    else:
+                        change_points, video_summary, screenshots = future.result()
+                except Exception as e:
+                    name = "Stage 1" if future is future_s1 else "Stage 2"
+                    errors[name] = e
+                    print(f"[Pipeline] {name} FAILED: {e}")
+            if errors:
+                msg = "; ".join(f"{k}: {v}" for k, v in errors.items())
+                raise RuntimeError(f"Parallel pipeline failed: {msg}")
+    else:
+        # ===== 顺序模式: 恢复路径 =====
+        if need_stage1:
+            transcript_result = _do_stage1()
+        elif transcript_path and os.path.exists(transcript_path):
             print(f"\n[Stage 1] Loading existing transcript: {transcript_path}")
             transcript_result = load_transcript(transcript_path)
             print(f"  Segments: {len(transcript_result.segments)}, Backend: {transcript_result.backend}")
+        elif not transcribe_audio:
+            print("\n[Stage 1: Ears] Skipped (--no-transcribe)")
+        _update_progress(output_dir, "stage1", "Stage 1 complete")
+
+        if need_stage2:
+            change_points, video_summary, screenshots = _do_stage2()
         else:
-            transcript_result = transcribe(
-                video_path=video_path,
-                backend=transcribe_backend,
-                model_size=whisper_model,
-                gemini_client=client if transcribe_backend in ("auto", "gemini") else None
-            )
-            # 保存转录结果
-            transcript_save_path = os.path.join(output_dir, f"{video_name}_transcript.json")
-            save_transcript(transcript_result, transcript_save_path)
-    else:
-        print("\n[Stage 1: Ears] Skipped (--no-transcribe)")
+            change_points = saved_change_points
+            video_summary = ""
+            print(f"\n[Stage 2] Resumed: {len(change_points)} change points from cache")
+            screenshots = []
+            for cp_item in change_points:
+                ts = cp_item["timestamp"]
+                safe_ts = ts.replace(":", "-")
+                ss_file = os.path.join(screenshot_dir, f"{safe_ts}.jpg")
+                if os.path.exists(ss_file):
+                    screenshots.append({
+                        "timestamp": ts, "path": ss_file,
+                        "desc": cp_item.get("description", ""),
+                        "type": cp_item.get("change_type", "")
+                    })
+            print(f"  Loaded {len(screenshots)} existing screenshots")
 
-    _update_progress(output_dir, "stage1", "Stage 1 complete")
+    # 确保 video_duration 有 transcript 补充
+    if video_duration <= 0 and transcript_result and transcript_result.duration > 0:
+        video_duration = transcript_result.duration
 
-    # ========== Stage 1.5: 生成 SRT 字幕文件 ==========
-    _update_progress(output_dir, "stage1.5", "Stage 1.5: SRT generation...")
+    # ========== SRT 生成 + 后台翻译（与 Stage 3 并行） ==========
     srt_paths = {}
+    _srt_translate_future = None
+    _srt_translate_executor = None
     if transcript_result and generate_srt:
         srt_path = os.path.join(output_dir, f"{video_name}.srt")
-
-        # Fix 7: SRT 缓存 — 已存在则跳过
         if os.path.exists(srt_path):
-            print(f"\n[Stage 1.5] SRT already exists, skipping: {srt_path}")
+            print(f"\n[SRT] Already exists, skipping: {srt_path}")
             srt_paths["en"] = srt_path
         else:
-            print(f"\n[Stage 1.5: SRT] Generating subtitles...")
+            print(f"\n[SRT] Generating subtitles...")
             generate_srt_from_transcript(transcript_result, srt_path)
             srt_paths["en"] = srt_path
             print(f"  SRT: {srt_path} ({len(transcript_result.segments)} segments)")
 
-        # 翻译字幕（也检查缓存）
         if srt_translate_lang:
             translated_srt_path = os.path.join(
                 output_dir, f"{video_name}.{srt_translate_lang}.srt"
@@ -1114,99 +1296,12 @@ def main(
                 print(f"  [Cache] Translated SRT exists: {translated_srt_path}")
                 srt_paths[srt_translate_lang] = translated_srt_path
             else:
-                print(f"  Translating to {srt_translate_lang}...")
-                result = translate_srt_file(
-                    srt_path, translated_srt_path, srt_translate_lang,
-                    gemini_client=client
+                print(f"  [Background] SRT translation to {srt_translate_lang} started...")
+                _srt_translate_executor = ThreadPoolExecutor(max_workers=1)
+                _srt_translate_future = _srt_translate_executor.submit(
+                    translate_srt_file, srt_path, translated_srt_path,
+                    srt_translate_lang, gemini_client=client
                 )
-                if result:
-                    srt_paths[srt_translate_lang] = result
-
-    # ========== Stage 2 (Eyes): 视觉检测 ==========
-    _update_progress(output_dir, "stage2", "Stage 2: Visual change detection...")
-
-    if skip_stage2:
-        # 恢复模式：使用已有的变化点
-        change_points = saved_change_points
-        video_summary = ""
-        print(f"\n[Stage 2] Resumed: {len(change_points)} change points from cache")
-    elif fusion:
-        # 双通道融合模式需要整体上传视频
-        print(f"\n[Stage 2] Uploading video for fusion mode: {video_path}")
-        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-        print(f"  File size: {file_size_mb:.1f} MB")
-
-        video_file = client.files.upload(file=video_path)
-        print("  Upload complete, waiting for processing...")
-        video_file = wait_for_processing(client, video_file)
-
-        from fusion_detector import FusionDetector, analyze_detection_quality
-
-        print("\n[融合模式] 启用双通道交叉验证")
-
-        detector = FusionDetector(client, video_file)
-        fused_points = detector.detect_and_fuse(
-            visual_prompt=CHANGE_DETECTION_PROMPT,
-            visual_schema=CHANGE_DETECTION_SCHEMA,
-            min_confidence=min_confidence
-        )
-
-        change_points = detector.to_legacy_format()
-        video_summary = ""
-
-        analysis = analyze_detection_quality(
-            detector.visual_points,
-            detector.semantic_points,
-            detector.fused_points
-        )
-        print(f"\n[分析] 匹配率: {analysis['fused_ratio']:.1%}")
-        for suggestion in analysis.get("suggestions", []):
-            print(f"  建议: {suggestion}")
-    else:
-        # 单通道模式：分段上传 + 视觉检测
-        result = phase1_detect_changes(client, video_path, density)
-        change_points = result.get("change_points", [])
-        video_summary = result.get("video_summary", "")
-
-    print(f"检测到 {len(change_points)} 个原始变化点")
-
-    # 过滤变化点
-    change_points = filter_change_points(change_points, min_interval)
-    print(f"过滤后保留 {len(change_points)} 个变化点（最小间隔: {min_interval}s）")
-
-    if not change_points:
-        print("警告：未检测到有效变化点，使用备用策略...")
-        change_points = [{"timestamp": "00:00", "change_type": "other", "description": "视频开始"}]
-
-    # ========== Stage 2.5: 覆盖率检查 + 自动补充 ==========
-    # 解决 Gemini 长视频只分析前半部分的问题
-    # 注意：优先使用 ffprobe 时长（最可靠），转录时长可能有 Gemini 幻觉
-    video_duration = get_video_duration(video_path)
-    if video_duration <= 0 and transcript_result and transcript_result.duration > 0:
-        video_duration = transcript_result.duration
-
-    if video_duration > 0:
-        change_points = fill_coverage_gaps(change_points, video_duration, gap_interval=30.0)
-
-    # ========== 提取截图 ==========
-    print("正在提取截图...")
-    screenshots = []
-    for i, cp in enumerate(change_points):
-        ts = cp["timestamp"]
-        safe_ts = ts.replace(":", "-")
-        output_file = os.path.join(screenshot_dir, f"{safe_ts}.jpg")
-
-        success = extract_screenshot(video_path, ts, output_file)
-        status = "[OK]" if success else "[FAIL]"
-        print(f"  [{i+1}/{len(change_points)}] {status} {ts} - {cp['description'][:30]}")
-
-        if success:
-            screenshots.append({
-                "timestamp": ts,
-                "path": output_file,
-                "desc": cp["description"],
-                "type": cp["change_type"]
-            })
 
     # ========== Stage 3 (Brain): 笔记生成 ==========
     _update_progress(output_dir, "stage3", "Stage 3: Generating notes...")
@@ -1380,6 +1475,19 @@ def main(
         print(f"   风格: {STYLES.get(style, {}).get('name', style)}")
     print(f"{'='*60}")
 
+    # 等待后台 SRT 翻译完成（如果有）
+    if _srt_translate_future:
+        try:
+            print("\n[SRT] Waiting for background translation to finish...")
+            result = _srt_translate_future.result(timeout=600)
+            if result:
+                srt_paths[srt_translate_lang] = result
+                print(f"  [SRT] Translation complete: {result}")
+        except Exception as e:
+            print(f"  [Warning] SRT translation failed (non-fatal): {e}")
+        finally:
+            _srt_translate_executor.shutdown(wait=False)
+
     _update_progress(output_dir, "done", "Pipeline complete!", status="completed")
 
     return md_path
@@ -1470,6 +1578,8 @@ V1 风格: minimal, detailed, academic, tutorial, business, outline, qa, summary
     srt_group.add_argument("--srt-lang", default=None,
                            help="SRT 翻译目标语言 (如 zh, ja, ko)，默认不翻译")
 
+    parser.add_argument("--daemon", action="store_true",
+                        help="后台运行模式：启动管道后立即退出，进度通过 progress.json 查询")
     parser.add_argument("--list-styles", action="store_true",
                         help="列出所有可用风格")
     parser.add_argument("--list-presets", action="store_true",
@@ -1480,6 +1590,34 @@ V1 风格: minimal, detailed, academic, tutorial, business, outline, qa, summary
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # --daemon: 后台运行模式，脚本自己 fork 子进程
+    if args.daemon:
+        import subprocess as _sp
+        # 构建子进程命令（移除 --daemon 防止递归）
+        child_args = [a for a in sys.argv if a != '--daemon']
+        child_cmd = [sys.executable] + child_args
+
+        # 日志路径与输出目录一致
+        _daemon_output_dir = args.output
+        os.makedirs(_daemon_output_dir, exist_ok=True)
+        log_path = os.path.join(_daemon_output_dir, "pipeline.log")
+
+        # Windows: CREATE_NO_WINDOW + DETACHED_PROCESS; Unix: start_new_session
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = _sp.CREATE_NO_WINDOW | _sp.DETACHED_PROCESS
+        else:
+            kwargs["start_new_session"] = True
+
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            proc = _sp.Popen(child_cmd, stdout=log_file, stderr=_sp.STDOUT,
+                             close_fds=(sys.platform != "win32"), **kwargs)
+
+        print(f"Pipeline started in background (PID: {proc.pid})")
+        print(f"  Log: {log_path}")
+        print(f"  Progress: {os.path.join(_daemon_output_dir, 'progress.json')}")
+        sys.exit(0)
 
     # 列出风格/预设
     if args.list_styles:

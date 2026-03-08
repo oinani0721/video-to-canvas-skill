@@ -115,9 +115,9 @@ hooks:
 
 ### 执行步骤
 
-1. **后台启动**三阶段管道（避免 Bash 10min 超时）：
+1. **后台启动**三阶段管道（`--daemon` 自守护，无需 nohup）：
    ```bash
-   cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 nohup uv run python video_to_md.py "<视频路径>" -o "<输出目录>" --depth balanced --srt-lang zh > "<输出目录>/pipeline.log" 2>&1 &
+   cd ~/.claude/skills/video-to-canvas/scripts && PYTHONUTF8=1 uv run python video_to_md.py "<视频路径>" -o "<输出目录>" --depth balanced --srt-lang zh --daemon
    ```
 
 2. **轮询进度**（每 30-60 秒检查一次 progress.json）：

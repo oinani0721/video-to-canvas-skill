@@ -1,6 +1,6 @@
 [project]
 name = "video-to-canvas"
-version = "2.1.0"
+version = "2.4.0"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "google-genai>=1.0",

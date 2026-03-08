@@ -675,6 +675,8 @@ if __name__ == "__main__":
 
     # === Subprocess worker mode ===
     if args.subprocess_worker:
+        import warnings
+        warnings.filterwarnings("ignore", message=".*pkg_resources.*", category=DeprecationWarning)
         if not args.audio or not args.output:
             print("错误：subprocess-worker 模式需要 --audio 和 --output 参数")
             sys.exit(1)

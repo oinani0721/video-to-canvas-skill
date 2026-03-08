@@ -155,7 +155,7 @@ def translate_srt_file(
     output_path: str,
     target_lang: str,
     gemini_client=None,
-    batch_size: int = 40
+    batch_size: int = 80
 ) -> str:
     """
     翻译 SRT 字幕文件为目标语言。
