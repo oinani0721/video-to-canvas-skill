@@ -504,6 +504,25 @@ TABLE_FORMATTING = """
 - 复杂公式放在表格外用列表展开
 """
 
+DIFFERENTIAL_CAPTIONS_SECTION = """
+## 截图差异分析（注意力锚点 — 重要！）
+
+以下是 AI 对相邻截图之间变化的详细分析。这些分析比截图描述更丰富（200-400字），
+包含准确的文字转录、图表结构描述、和变化原因分析。
+
+**请利用这些分析来：**
+1. 理解视频内容的演进脉络（从 A 话题如何过渡到 B 话题）
+2. 确保笔记覆盖每个重要变化点的内容
+3. 正确描述图表、公式、代码的变化过程（不要遗漏差异分析中提到的内容）
+4. 当截图中的文字不清晰时，以差异分析中的文字转录为准
+
+### 差异分析列表
+{differential_captions}
+
+**注意**：差异分析是对截图内容的补充描述，不是替代。你仍然需要仔细观察截图本身。
+当差异分析与你观察到的截图内容有冲突时，以你直接观察到的为准。
+"""
+
 TRICKY_QUESTIONS = """
 ## 理解检测
 
@@ -666,6 +685,22 @@ class PromptBuilderV2:
             transcript_text if transcript_text else "（无转录文本）"
         )
         self.parts.append(integration)
+        return self
+
+    def with_differential_captions(self, captions_text: str) -> "PromptBuilderV2":
+        """
+        添加差异化描述（注意力锚点）— Stage 2b 输出
+
+        Args:
+            captions_text: 格式化的差异描述文本，来自
+                differential_captioner.format_captions_for_prompt()
+        """
+        if captions_text:
+            section = DIFFERENTIAL_CAPTIONS_SECTION.replace(
+                "{differential_captions}",
+                captions_text
+            )
+            self.parts.append(section)
         return self
 
     def with_inference(self) -> "PromptBuilderV2":

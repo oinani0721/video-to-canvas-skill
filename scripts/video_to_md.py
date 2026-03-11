@@ -1,15 +1,18 @@
 """
-三阶段混合管道：WhisperX/Gemini 转录 + Gemini 视觉检测 + LLM 笔记生成
+三阶段混合管道 v3.0：WhisperX/Gemini 转录 + 本地变化检测 + LLM 笔记生成
 
-三阶段架构（社区验证最佳实践）：
+三阶段架构：
 1. Stage 1 (Ears): 音频转录 — WhisperX (首选) 或 Gemini Audio (备选)
-2. Stage 2 (Eyes): Gemini 视觉检测变化点 + FFmpeg 截图提取
+2. Stage 2 (Eyes): 本地 OCR-diff + SSIM 变化检测 + FFmpeg 截图（v3.0 默认）
+                   或 Gemini 视觉检测（--detector gemini 旧模式）
 3. Stage 3 (Brain): LLM 融合转录文本 + 截图 → 结构化笔记
 
-解决的核心问题：
-- 旧架构只发送截图给 LLM，完全丢失音频内容
-- Gemini 直接处理 >20 分钟视频有严重幻觉风险
-- 新架构通过 15 分钟分段 + 双通道融合避免信息丢失
+v3.0 升级要点：
+- Stage 2a: 本地检测器（OCR-diff + SSIM + 定期采样 + 三层去重），$0 成本
+- Stage 2b: 差异化描述生成（Gemini Flash 相邻截图对比 → 200+ 字 Rich Caption）
+- 解决 Gemini 漏检同模板PPT/代码修改的问题（ShareGPT4Video: +3.4 avg points）
+- Stage 2 成本从 ~$0.05/min 降为 ~$0.001/截图（仅 2b 用 API）
+- 保留 --detector gemini 作为可选后备
 
 用法:
     python video_to_md.py <视频路径> [选项]
@@ -98,6 +101,8 @@ from prompt_builder_v2 import (
 )
 from transcriber import transcribe, save_transcript, load_transcript, TranscriptResult
 from srt_generator import generate_srt_from_transcript, translate_srt_file
+from local_detector import detect_local, cleanup_frames
+from differential_captioner import caption_screenshots, format_captions_for_prompt
 import shutil
 
 
@@ -841,7 +846,8 @@ def phase2_generate_notes(
     transcript_result: TranscriptResult = None,
     segment_minutes: float = 15.0,
     video_duration: float = 0.0,
-    output_dir: str = None
+    output_dir: str = None,
+    change_points: list = None
 ) -> str:
     """
     Stage 3 (Brain)：融合转录文本 + 截图生成高质量笔记
@@ -871,13 +877,14 @@ def phase2_generate_notes(
         return _generate_notes_segmented(
             client, screenshots, style, video_summary,
             use_v2, depth, transcript_result, segment_minutes,
-            video_duration, output_dir
+            video_duration, output_dir, change_points
         )
 
     # 单段处理（视频较短或无转录）
     return _generate_notes_single(
         client, screenshots, style, video_summary,
-        use_v2, depth, transcript_result
+        use_v2, depth, transcript_result,
+        change_points=change_points
     )
 
 
@@ -1068,7 +1075,8 @@ def _generate_notes_single(
     use_v2: bool,
     depth: str,
     transcript_result: TranscriptResult = None,
-    is_continuation: bool = False
+    is_continuation: bool = False,
+    change_points: list = None
 ) -> str:
     """单段笔记生成（用于短视频或单个分段）"""
 
@@ -1107,6 +1115,11 @@ def _generate_notes_single(
 
         # 截图作为辅助，在推理之后
         builder.with_screenshots(screenshots)
+
+        # Stage 2b 差异化描述作为注意力锚点（如果有）
+        if change_points and any(cp.get("differential_caption") for cp in change_points):
+            captions_text = format_captions_for_prompt(change_points)
+            builder.with_differential_captions(captions_text)
 
         builder.with_summary()
 
@@ -1161,7 +1174,8 @@ def _generate_notes_segmented(
     transcript_result: TranscriptResult,
     segment_minutes: float,
     video_duration: float = 0.0,
-    output_dir: str = None
+    output_dir: str = None,
+    change_points: list = None
 ) -> str:
     """
     分段笔记生成（用于长视频，避免 Gemini 幻觉）
@@ -1240,12 +1254,21 @@ def _generate_notes_segmented(
             _update_progress(output_dir, "stage3",
                              f"Stage 3: Generating chunk {i+1}/{total_chunks}...")
 
+        # 筛选该时间段内的 change_points（用于差异化描述）
+        chunk_cps = None
+        if change_points:
+            chunk_cps = [
+                cp for cp in change_points
+                if chunk_start - 5 <= parse_timestamp_to_seconds(cp["timestamp"]) <= chunk_end + 5
+            ]
+
         rate_limiter.wait()
         segment_notes = _generate_notes_single(
             client, chunk_screenshots, style,
             video_summary if i == 0 else "",
             use_v2, depth, chunk_transcript,
-            is_continuation=(i > 0)
+            is_continuation=(i > 0),
+            change_points=chunk_cps
         )
 
         # 立即保存 chunk（防止中断丢失）
@@ -1352,7 +1375,8 @@ def main(
     segment_minutes: float = 15.0,
     transcript_path: str = None,
     generate_srt: bool = True,
-    srt_translate_lang: str = None
+    srt_translate_lang: str = None,
+    detector: str = "local"
 ):
     # 自动风格检测：文件名含 lecture/lec → 使用 lecture 模式
     video_basename = os.path.basename(video_path).lower()
@@ -1470,11 +1494,47 @@ def main(
         print("[Pipeline] Stage 1 complete")
         return result
 
-    # ----- Stage 2 线程函数（Gemini API 视觉检测 + 截图） -----
+    # ----- Stage 2 线程函数（本地检测 或 Gemini API 视觉检测 + 截图） -----
     def _do_stage2():
         _update_progress(output_dir, "stage2", "Stage 2: Visual change detection...",
                          parallel_stages=["stage1", "stage2"] if need_stage1 else None)
-        if fusion:
+
+        if detector == "local":
+            # ===== v3.0 本地变化检测（OCR-diff + SSIM + 定期采样） =====
+            print("\n[Stage 2] 本地变化检测模式 (v3.0)")
+            temp_frames_dir = os.path.join(output_dir, "_temp_frames")
+            result = detect_local(
+                video_path,
+                fps=1.0,
+                ssim_threshold=0.92,
+                text_threshold=0.90,
+                periodic_interval=30.0,
+                debounce_window=5.0,
+                max_frames=40,
+                scale=640,
+                temp_dir=temp_frames_dir
+            )
+            cp = result.get("change_points", [])
+            vs = result.get("video_summary", "")
+
+            # 使用高清截图替换低分辨率检测帧
+            ss = _extract_screenshots_parallel(video_path, cp, screenshot_dir)
+
+            # 清理临时帧
+            cleanup_frames(temp_frames_dir)
+
+            # Stage 2b: Differential captioning (enrich descriptions with Gemini Flash)
+            try:
+                cp = caption_screenshots(client, cp, screenshot_dir)
+                print(f"[Pipeline] Stage 2b complete (differential captions)")
+            except Exception as e:
+                print(f"[Pipeline] Stage 2b skipped (captioning failed: {e})")
+
+            print(f"[Pipeline] Stage 2 complete ({len(ss)} screenshots, local detector)")
+            return cp, vs, ss
+
+        elif fusion:
+            # ===== 旧模式: Gemini 双通道融合 =====
             print(f"\n[Stage 2] Uploading video for fusion mode: {video_path}")
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             print(f"  File size: {file_size_mb:.1f} MB")
@@ -1489,21 +1549,22 @@ def main(
             video_file = wait_for_processing(client, video_file)
             from fusion_detector import FusionDetector, analyze_detection_quality
             print("\n[融合模式] 启用双通道交叉验证")
-            detector = FusionDetector(client, video_file)
-            detector.detect_and_fuse(
+            fd = FusionDetector(client, video_file)
+            fd.detect_and_fuse(
                 visual_prompt=CHANGE_DETECTION_PROMPT,
                 visual_schema=CHANGE_DETECTION_SCHEMA,
                 min_confidence=min_confidence
             )
-            cp = detector.to_legacy_format()
+            cp = fd.to_legacy_format()
             vs = ""
             analysis = analyze_detection_quality(
-                detector.visual_points, detector.semantic_points, detector.fused_points
+                fd.visual_points, fd.semantic_points, fd.fused_points
             )
             print(f"\n[分析] 匹配率: {analysis['fused_ratio']:.1%}")
             for suggestion in analysis.get("suggestions", []):
                 print(f"  建议: {suggestion}")
         else:
+            # ===== 旧模式: Gemini 单通道 =====
             result = phase1_detect_changes(client, video_path, density)
             cp = result.get("change_points", [])
             vs = result.get("video_summary", "")
@@ -1621,7 +1682,8 @@ def main(
         transcript_result=transcript_result,
         segment_minutes=segment_minutes,
         video_duration=video_duration,
-        output_dir=output_dir
+        output_dir=output_dir,
+        change_points=change_points
     )
 
     # ========== 质量评估循环 ==========
@@ -1879,8 +1941,11 @@ V1 风格: minimal, detailed, academic, tutorial, business, outline, qa, summary
                         help="变化检测密度 (默认: normal)")
     parser.add_argument("--min-interval", type=float, default=2.0,
                         help="最小截图间隔秒数 (默认: 2.0)")
+    parser.add_argument("--detector", default="local",
+                        choices=["local", "gemini"],
+                        help="变化检测器: local=本地OCR+SSIM(v3.0默认), gemini=Gemini视觉(旧模式)")
     parser.add_argument("--fusion", action="store_true",
-                        help="启用双通道融合模式（视觉+语义交叉验证）")
+                        help="启用双通道融合模式（视觉+语义交叉验证，需 --detector gemini）")
     parser.add_argument("--min-confidence", type=float, default=0.0,
                         help="最小置信度阈值，仅融合模式有效 (默认: 0.0)")
     # 转录参数（三阶段管道）
@@ -1982,7 +2047,8 @@ if __name__ == "__main__":
             segment_minutes=args.segment_minutes,
             transcript_path=args.transcript,
             generate_srt=not args.no_srt,
-            srt_translate_lang=args.srt_lang
+            srt_translate_lang=args.srt_lang,
+            detector=args.detector
         )
     except Exception as e:
         import traceback

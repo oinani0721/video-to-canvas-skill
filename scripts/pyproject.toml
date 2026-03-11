@@ -1,12 +1,17 @@
 [project]
 name = "video-to-canvas"
-version = "2.4.0"
+version = "3.0.0"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "google-genai>=1.0",
+    "opencv-python-headless>=4.8",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
+ocr = [
+    "rapidocr-onnxruntime>=1.3",
+]
 gpu = [
     "faster-whisper>=1.0",
     "ctranslate2==4.6.0",
