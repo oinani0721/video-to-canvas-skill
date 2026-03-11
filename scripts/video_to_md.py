@@ -37,6 +37,23 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def _safe_upload_path(filepath: str):
+    """If filepath contains non-ASCII chars, create a temp hardlink with ASCII-safe name.
+    Returns (safe_path, needs_cleanup). Caller must delete safe_path if needs_cleanup=True."""
+    try:
+        filepath.encode('ascii')
+        return filepath, False
+    except UnicodeEncodeError:
+        ext = os.path.splitext(filepath)[1]
+        safe_path = tempfile.mktemp(suffix=ext)
+        try:
+            os.link(filepath, safe_path)
+        except OSError:
+            import shutil
+            shutil.copy2(filepath, safe_path)
+        return safe_path, True
+
+
 def _load_env_files():
     """Load .env from skill directory, scripts dir, or legacy location"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -726,7 +743,13 @@ def phase1_detect_changes(client, video_path: str, density: str = "normal") -> d
         seg_count = len(segments)
         print(f"\n[Stage 2] Segment {i+1}/{seg_count}: uploading to Gemini...")
 
-        vf = client.files.upload(file=seg_path)
+        upload_path, needs_cleanup = _safe_upload_path(seg_path)
+        try:
+            vf = client.files.upload(file=upload_path)
+        finally:
+            if needs_cleanup:
+                try: os.remove(upload_path)
+                except OSError: pass
         vf = wait_for_processing(client, vf)
 
         response_text = _gemini_generate_with_retry(
@@ -1455,7 +1478,13 @@ def main(
             print(f"\n[Stage 2] Uploading video for fusion mode: {video_path}")
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             print(f"  File size: {file_size_mb:.1f} MB")
-            video_file = client.files.upload(file=video_path)
+            upload_path, needs_cleanup = _safe_upload_path(video_path)
+            try:
+                video_file = client.files.upload(file=upload_path)
+            finally:
+                if needs_cleanup:
+                    try: os.remove(upload_path)
+                    except OSError: pass
             print("  Upload complete, waiting for processing...")
             video_file = wait_for_processing(client, video_file)
             from fusion_detector import FusionDetector, analyze_detection_quality

@@ -22,13 +22,17 @@ _fw_model_ref = None  # Global ref to prevent GC of WhisperModel (CUDA destructo
 
 class TranscriptSegment:
     """单条转录片段"""
-    def __init__(self, start: float, end: float, text: str):
+    def __init__(self, start: float, end: float, text: str, words: list = None):
         self.start = start
         self.end = end
         self.text = text.strip()
+        self.words = words  # list of {"start": float, "end": float, "word": str} or None
 
     def to_dict(self) -> dict:
-        return {"start": self.start, "end": self.end, "text": self.text}
+        d = {"start": self.start, "end": self.end, "text": self.text}
+        if self.words:
+            d["words"] = self.words
+        return d
 
     def __repr__(self):
         return f"[{self.start:.1f}-{self.end:.1f}] {self.text[:50]}"
@@ -224,13 +228,17 @@ def transcribe_with_faster_whisper(
     detected_lang = info.language
     print(f"  检测语言: {detected_lang} (概率: {info.language_probability:.2f})")
 
-    # 收集所有段落
+    # 收集所有段落（保留 word-level timestamps 用于 SRT 精确切分）
     segments = []
     for seg in segments_iter:
+        words = None
+        if seg.words:
+            words = [{"start": w.start, "end": w.end, "word": w.word} for w in seg.words]
         segments.append(TranscriptSegment(
             start=seg.start,
             end=seg.end,
-            text=seg.text
+            text=seg.text,
+            words=words
         ))
 
     elapsed = time.time() - start_time
@@ -632,7 +640,7 @@ def load_transcript(path: str) -> TranscriptResult:
         data = json.load(f)
 
     segments = [
-        TranscriptSegment(s["start"], s["end"], s["text"])
+        TranscriptSegment(s["start"], s["end"], s["text"], words=s.get("words"))
         for s in data["segments"]
     ]
 

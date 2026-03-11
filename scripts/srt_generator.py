@@ -5,11 +5,22 @@ SRT 字幕生成模块 - 从 TranscriptResult 生成精确时间戳字幕
 - 从 faster-whisper 转录直接生成 SRT（精确时间戳，无需偏移）
 - 从 Gemini 转录生成 SRT（需要时间偏移校正）
 - 使用 Gemini API 批量翻译生成多语言字幕
+- 智能分段：利用 word-level timestamps 按句子/子句切分，每条字幕 ≤2 行
 """
 
 import os
 import re
 import time
+
+# 字幕行业标准参数
+MAX_CHARS_PER_ENTRY = 84   # 2 行 × 42 字符
+MAX_DURATION = 7.0          # 每条字幕最长 7 秒
+MIN_DURATION = 0.5          # 每条字幕最短 0.5 秒
+MAX_CHARS_PER_LINE = 42     # 单行最大字符数
+
+# 断句标点（英文 + 中文）
+_SENTENCE_END = re.compile(r'[.!?;:。！？；：]$')
+_CLAUSE_BREAK = re.compile(r'[,，、]$')
 
 
 def _format_srt_time(seconds: float) -> str:
@@ -23,17 +34,108 @@ def _format_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def generate_srt_from_transcript(transcript_result, output_path: str, max_chars: int = 80) -> str:
-    """
-    从 TranscriptResult 生成 SRT 字幕文件。
+def _wrap_lines(text: str, max_line: int = MAX_CHARS_PER_LINE) -> str:
+    """将文本折行为最多 2 行，每行不超过 max_line 字符"""
+    if len(text) <= max_line:
+        return text
+    words = text.split()
+    line1 = []
+    line1_len = 0
+    for i, w in enumerate(words):
+        if line1_len + len(w) + (1 if line1 else 0) > max_line and line1:
+            break
+        line1.append(w)
+        line1_len += len(w) + (1 if len(line1) > 1 else 0)
+    else:
+        return " ".join(line1)
+    line2_words = words[len(line1):]
+    return " ".join(line1) + "\n" + " ".join(line2_words)
 
-    faster-whisper 的时间戳直接对应视频实际时间，无需偏移。
-    Gemini 的时间戳可能有时间基准偏移，但仍直接使用（用户可通过播放器微调）。
+
+def _split_segment_with_words(seg, max_chars=MAX_CHARS_PER_ENTRY, max_dur=MAX_DURATION):
+    """
+    使用 word-level timestamps 将一个 segment 切分为多条 SRT entry。
+
+    算法：两步走
+    1. 按标点将 words 分成 clauses（子句）
+    2. 贪心合并短 clauses，直到超过 max_chars 或 max_dur
+
+    Returns:
+        list of (start, end, text)
+    """
+    words = seg.words
+    if not words:
+        return [(seg.start, seg.end, seg.text)]
+
+    # TODO(human): 实现切分算法核心逻辑
+    # Step 1: 将 words 按标点分成 clauses
+    # Step 2: 贪心合并 clauses 为 SRT entries
+    # 返回 list of (start_time, end_time, text)
+    return [(seg.start, seg.end, seg.text)]
+
+
+def _split_segment_by_text(seg, max_chars=MAX_CHARS_PER_ENTRY, max_dur=MAX_DURATION):
+    """
+    无 word timestamps 时的回退：按句子切分 + 线性插值时间。
+
+    Returns:
+        list of (start, end, text)
+    """
+    text = seg.text.strip()
+    duration = seg.end - seg.start
+
+    if len(text) <= max_chars and duration <= max_dur:
+        return [(seg.start, seg.end, text)]
+
+    # 按句子边界切分
+    sentences = re.split(r'(?<=[.!?;:。！？；：])\s+', text)
+    if len(sentences) <= 1:
+        # 无法按句子切分，按字符数等分
+        sentences = []
+        words = text.split()
+        current = []
+        current_len = 0
+        for w in words:
+            if current_len + len(w) + 1 > max_chars and current:
+                sentences.append(" ".join(current))
+                current = [w]
+                current_len = len(w)
+            else:
+                current.append(w)
+                current_len += len(w) + 1
+        if current:
+            sentences.append(" ".join(current))
+
+    # 线性插值时间戳（按字符比例分配）
+    total_chars = sum(len(s) for s in sentences)
+    if total_chars == 0:
+        return [(seg.start, seg.end, text)]
+
+    entries = []
+    cursor = seg.start
+    for s in sentences:
+        ratio = len(s) / total_chars
+        entry_dur = duration * ratio
+        entry_end = min(cursor + entry_dur, seg.end)
+        if s.strip():
+            entries.append((cursor, entry_end, s.strip()))
+        cursor = entry_end
+
+    return entries if entries else [(seg.start, seg.end, text)]
+
+
+def generate_srt_from_transcript(transcript_result, output_path: str, max_chars: int = MAX_CHARS_PER_ENTRY) -> str:
+    """
+    从 TranscriptResult 生成 SRT 字幕文件（智能分段）。
+
+    对每个 transcript segment：
+    - 有 word timestamps → 按标点断句 + word 时间精确切分
+    - 无 word timestamps → 按句子断句 + 线性时间插值
 
     Args:
         transcript_result: TranscriptResult 对象
         output_path: 输出 SRT 文件路径
-        max_chars: 每条字幕最大字符数（超长则分行）
+        max_chars: 每条字幕最大字符数
 
     Returns:
         输出文件路径
@@ -45,40 +147,25 @@ def generate_srt_from_transcript(transcript_result, output_path: str, max_chars:
         text = seg.text.strip()
         if not text:
             continue
-
-        start = seg.start
-        end = seg.end
-
-        # 跳过无效时间段
-        if end <= 0 or end <= start:
+        if seg.end <= 0 or seg.end <= seg.start:
             continue
 
-        # 如果文本太长，分成多行显示
-        if len(text) > max_chars:
-            words = text.split()
-            lines = []
-            current_line = []
-            current_len = 0
-            for word in words:
-                if current_len + len(word) + 1 > max_chars and current_line:
-                    lines.append(" ".join(current_line))
-                    current_line = [word]
-                    current_len = len(word)
-                else:
-                    current_line.append(word)
-                    current_len += len(word) + 1
-            if current_line:
-                lines.append(" ".join(current_line))
-            display_text = "\n".join(lines)
+        # 根据是否有 word timestamps 选择切分策略
+        if seg.words:
+            sub_entries = _split_segment_with_words(seg, max_chars)
         else:
-            display_text = text
+            sub_entries = _split_segment_by_text(seg, max_chars)
 
-        srt_entries.append(
-            f"{idx}\n"
-            f"{_format_srt_time(start)} --> {_format_srt_time(end)}\n"
-            f"{display_text}\n"
-        )
-        idx += 1
+        for start, end, entry_text in sub_entries:
+            if not entry_text.strip():
+                continue
+            display_text = _wrap_lines(entry_text.strip())
+            srt_entries.append(
+                f"{idx}\n"
+                f"{_format_srt_time(start)} --> {_format_srt_time(end)}\n"
+                f"{display_text}\n"
+            )
+            idx += 1
 
     srt_content = "\n".join(srt_entries)
 
